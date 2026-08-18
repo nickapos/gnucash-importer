@@ -13,9 +13,11 @@ sqlite3 first if your book is still in XML format).
 import csv
 import json
 import os
+import re
 import warnings
 import piecash
 import hashlib
+from decimal import Decimal
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from typing import Dict, List, Optional, Tuple, Set
@@ -23,33 +25,26 @@ import difflib
 
 from sqlalchemy import exc as sa_exc
 
-# Silence piecash/SQLAlchemy 1.4 "overlapping relationship" warnings --
-# these are cosmetic issues inside piecash's own ORM mapping and do not
-# affect correctness.
 warnings.filterwarnings("ignore", category=sa_exc.SAWarning)
 
-# Configuration
 DEFAULT_GNUCASH_FILE = "portfolio-sqlite.gnucash"
 DEFAULT_CSV_FILE = "transactions.csv"
-BASE_CURRENCY = "GBP"  # Default currency if none specified
+BASE_CURRENCY = "GBP"
 MAX_ACCOUNT_SUGGESTIONS = 5
 DUPLICATE_CHECK_FILE = ".imported_transactions.json"
 MAPPINGS_FILE = ".payee_account_mappings.json"
 TRANSACTION_HISTORY_FILE = ".transaction_history_analysis.json"
 ACCOUNTS_EXPORT_FILE = "accounts.json"
-SUPPORTED_CURRENCIES = {"GBP", "USD", "EUR"}  # Currencies we handle
+SUPPORTED_CURRENCIES = {"GBP", "USD", "EUR"}
 
 
-# --------------------------------------------------------------
-# 1. Transaction-history analyzer
-# --------------------------------------------------------------
 class TransactionHistoryAnalyzer:
     """Analyzes past transactions to learn payee -> account patterns"""
 
     def __init__(self, book: piecash.Book):
         self.book = book
-        self.payee_to_accounts = defaultdict(list)  # payee -> [{account, count, confidence}]
-        self.word_patterns = defaultdict(Counter)    # word -> {account: count}
+        self.payee_to_accounts = defaultdict(list)
+        self.word_patterns = defaultdict(Counter)
         self.analysis_cache = self._load_analysis()
 
     def _load_analysis(self) -> dict:
@@ -74,7 +69,7 @@ class TransactionHistoryAnalyzer:
         txns.sort(key=lambda t: t.post_date or t.enter_date, reverse=True)
         txns = txns[:max_transactions]
 
-        payee_usage = defaultdict(Counter)  # payee -> {account_fullname: count}
+        payee_usage = defaultdict(Counter)
 
         for txn in txns:
             if not txn.splits:
@@ -89,7 +84,6 @@ class TransactionHistoryAnalyzer:
                     for w in self._extract_words(payee):
                         self.word_patterns[w][account_full] += 1
 
-        # Keep top 5 accounts per payee
         self.payee_to_accounts = defaultdict(list)
         for payee, accts in payee_usage.items():
             top_count = max(accts.values())
@@ -127,8 +121,6 @@ class TransactionHistoryAnalyzer:
 
     @staticmethod
     def _extract_words(text: str) -> List[str]:
-        import re
-
         text = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
         words = text.split()
         stop = {
@@ -139,12 +131,10 @@ class TransactionHistoryAnalyzer:
     def suggest_mapping(
         self, csv_payee: str, csv_description: str = ""
     ) -> List[Tuple[str, float, str]]:
-        """Return [(account_fullname, confidence, reason), ...]"""
         suggestions = []
         payee_l = csv_payee.lower().strip()
         desc_l = csv_description.lower().strip()
 
-        # 1. exact payee match
         if csv_payee in self.payee_to_accounts:
             for m in self.payee_to_accounts[csv_payee]:
                 suggestions.append(
@@ -155,7 +145,6 @@ class TransactionHistoryAnalyzer:
                     )
                 )
 
-        # 2. fuzzy payee match (similarity > 70%)
         for payee, mlist in self.payee_to_accounts.items():
             sim = self._similarity(payee_l, payee.lower())
             if sim > 0.7:
@@ -168,7 +157,6 @@ class TransactionHistoryAnalyzer:
                         )
                     )
 
-        # 3. word-pattern matching
         csv_words = set(self._extract_words(csv_payee + " " + csv_description))
         word_scores = defaultdict(float)
         for w in csv_words:
@@ -186,7 +174,6 @@ class TransactionHistoryAnalyzer:
                     )
                 )
 
-        # 4. description matching
         if csv_description:
             for payee, mlist in self.payee_to_accounts.items():
                 if desc_l in payee.lower() or payee.lower() in desc_l:
@@ -199,7 +186,6 @@ class TransactionHistoryAnalyzer:
                             )
                         )
 
-        # de-duplicate, keep highest confidence per account
         best = {}
         for acct, conf, reason in suggestions:
             if acct not in best or conf > best[acct][0]:
@@ -216,9 +202,6 @@ class TransactionHistoryAnalyzer:
         ][:limit]
 
 
-# --------------------------------------------------------------
-# 2. Payee-to-account mapper (persistent JSON file)
-# --------------------------------------------------------------
 class PayeeAccountMapper:
     def __init__(self, mappings_file: str = MAPPINGS_FILE):
         self.mappings_file = mappings_file
@@ -245,7 +228,6 @@ class PayeeAccountMapper:
     def get_mapping(self, payee: str) -> Optional[Dict]:
         if payee in self.mappings:
             return self.mappings[payee]
-        # fuzzy fallback
         pl = payee.lower().strip()
         for sp, m in self.mappings.items():
             spl = sp.lower().strip()
@@ -285,20 +267,36 @@ class PayeeAccountMapper:
         )
 
 
-# --------------------------------------------------------------
-# 3. Bank-format mapper (Revolut / Bank-of-Scotland / generic)
-# --------------------------------------------------------------
 class BankFormatMapper:
     @staticmethod
     def map_revolut(row: dict) -> dict:
-        return {
-            "date": row.get("date") or row.get("transaction_date", ""),
-            "payee": row.get("counterparty")
+        date_str = (
+            row.get("Completed Date")
+            or row.get("Started Date")
+            or row.get("date")
+            or row.get("transaction_date", "")
+        )
+        payee = (
+            row.get("Description")
+            or row.get("counterparty")
             or row.get("description")
-            or row.get("merchant_name", ""),
-            "amount": float(str(row.get("amount", "0")).replace(",", ".")),
-            "currency": row.get("currency", "").upper() or BASE_CURRENCY,
-            "memo": row.get("notes") or row.get("description", ""),
+            or row.get("merchant_name", "")
+        )
+        raw_amount = row.get("Amount", row.get("amount", "0"))
+        try:
+            amount = float(str(raw_amount).replace("£", "").replace(",", "."))
+        except ValueError:
+            amount = 0.0
+        currency = (row.get("Currency") or row.get("currency", "")).upper() or BASE_CURRENCY
+        state = row.get("State", "")
+        memo_parts = [p for p in [row.get("Type", ""), state] if p]
+        return {
+            "date": date_str,
+            "payee": payee,
+            "amount": amount,
+            "currency": currency,
+            "memo": " / ".join(memo_parts) if memo_parts else row.get("notes", ""),
+            "state": state,
             "original_row": row,
         }
 
@@ -328,14 +326,18 @@ class BankFormatMapper:
                 header = next(csv.reader(f))
             hl = [h.strip().lower() for h in header]
             ho = [h.strip() for h in header]
-            if any("counterparty" in h for h in hl) or any(
-                "transaction" in h for h in hl
-            ):
+
+            revolut_signals = ["started date", "completed date", "product", "state"]
+            if any("counterparty" in h for h in hl) or sum(
+                sig in hl for sig in revolut_signals
+            ) >= 2:
                 return "revolut"
+
             if any("posting date" == h.lower() for h in ho) or any(
                 "posting date" in h for h in hl
             ):
                 return "bof_scot"
+
             required = ["date", "payee", "amount"]
             if all(any(rc in h for h in hl) for rc in required):
                 return "generic"
@@ -345,7 +347,6 @@ class BankFormatMapper:
 
     @staticmethod
     def map_generic(row: dict) -> dict:
-        # Case-insensitive lookup so headers like "Date"/"Payee"/"Amount" work too
         lower_row = {k.lower().strip(): v for k, v in row.items()}
         try:
             amt = float(
@@ -363,9 +364,6 @@ class BankFormatMapper:
         }
 
 
-# --------------------------------------------------------------
-# 4. Account matcher (history + name + currency)
-# --------------------------------------------------------------
 class AccountMatcher:
     def __init__(
         self,
@@ -385,13 +383,55 @@ class AccountMatcher:
 
     @staticmethod
     def _acct_currency_matches(acct: object, code: str) -> bool:
-        """Return True if acct.currency is ISO4217 `code` (case-insensitive)"""
-        if not getattr(acct, "currency", None):
+        """Return True if acct's commodity is a currency matching `code`
+        (case-insensitive). piecash/GnuCash stores currency commodities
+        with namespace == "CURRENCY", not "ISO4217" -- ISO4217 is just the
+        real-world standard name, not the stored value."""
+        cur = getattr(acct, "commodity", None)
+        if not cur:
             return False
         return (
-            acct.currency.namespace == "ISO4217"
-            and acct.currency.name.upper() == code.upper()
+            cur.namespace == "CURRENCY"
+            and cur.mnemonic.upper() == code.upper()
         )
+
+    @staticmethod
+    def _extract_tokens(text: str) -> Set[str]:
+        text = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
+        words = text.split()
+        stop = {
+            "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+        }
+        return set(w for w in words if len(w) > 2 and w not in stop)
+
+    def _keyword_account_matches(
+        self, payee: str, transaction_currency: str
+    ) -> List[Tuple[object, float, str]]:
+        """Token-overlap matching against account NAMES (not transaction
+        history). Catches cases like 'Charing Cross Car Park' matching
+        'Expenses:Auto:Parking:Odyssey car park' via shared words
+        ('car', 'park') even though neither string contains the other,
+        and neither has been seen in a past transaction yet."""
+        payee_tokens = self._extract_tokens(payee)
+        if not payee_tokens:
+            return []
+
+        matches = []
+        for acct in self.accounts_cache.values():
+            if not self._acct_currency_matches(acct, transaction_currency):
+                continue
+            acct_tokens = self._extract_tokens(acct.fullname.replace(":", " "))
+            overlap = payee_tokens & acct_tokens
+            if not overlap:
+                continue
+            score = len(overlap) / len(payee_tokens)
+            if any(len(w) >= 5 for w in overlap):
+                score = min(score + 0.15, 0.9)
+            reason = f"Keyword match: shared word(s) {', '.join(sorted(overlap))!r}"
+            matches.append((acct, round(score, 2), reason))
+
+        matches.sort(key=lambda x: x[1], reverse=True)
+        return matches
 
     def find_matching_accounts(
         self,
@@ -400,11 +440,8 @@ class AccountMatcher:
         transaction_currency: str = BASE_CURRENCY,
         max_suggestions: int = MAX_ACCOUNT_SUGGESTIONS,
     ) -> List[Tuple[object, float, str]]:
-        """Return up to max_suggestions [(account, confidence, reason), ...]
-        only for accounts whose currency matches."""
         all_sug = []
 
-        # 1. manual mapping - only if currency matches
         mm = self.payee_mapper.get_mapping(payee)
         if mm:
             acct = self.get_account_by_guid(mm["account_guid"])
@@ -413,7 +450,6 @@ class AccountMatcher:
                     (acct, 1.0, f"Manual mapping (used {mm.get('use_count', 1)} times)")
                 )
 
-        # 2. suggestions from transaction history - filter by currency
         for acct_full, conf, reason in self.history_analyzer.suggest_mapping(
             payee, description
         ):
@@ -421,11 +457,10 @@ class AccountMatcher:
             if acct and self._acct_currency_matches(acct, transaction_currency):
                 all_sug.append((acct, conf, f"History: {reason}"))
 
-        # 3. simple name-based matching - only consider accounts with right currency
         payee_l = payee.lower().strip()
         for acct in self.accounts_cache.values():
             if not self._acct_currency_matches(acct, transaction_currency):
-                continue  # skip accounts with wrong currency
+                continue
             an_l = acct.name.lower().strip()
             fn_l = acct.fullname.lower().strip()
             if payee_l == an_l or payee_l == fn_l:
@@ -435,7 +470,10 @@ class AccountMatcher:
             elif an_l.find(payee_l) != -1 or fn_l.find(payee_l) != -1:
                 all_sug.append((acct, 0.7, "Payee contained in account name"))
 
-        # de-duplicate & sort by confidence (highest first)
+        all_sug.extend(
+            self._keyword_account_matches(payee, transaction_currency)
+        )
+
         best = {}
         for ac, conf, reason in all_sug:
             if ac.guid not in best or conf > best[ac.guid][0]:
@@ -465,7 +503,7 @@ class AccountMatcher:
             return "Expenses:Shopping"
         if any(
             w in pl
-            for w in ["shell", "bp", "esso", "petrol", "fuel", "transport", "uber", "train", "bus"]
+            for w in ["shell", "bp", "esso", "petrol", "fuel", "transport", "uber", "train", "bus", "car park", "parking"]
         ):
             return "Expenses:Transportation"
         if any(w in pl for w in ["netflix", "spotify", "subscription", "monthly", "disney", "prime"]):
@@ -479,6 +517,24 @@ class AccountMatcher:
             return "Expenses:Utilities"
         return "Expenses:Miscellaneous"
 
+    @staticmethod
+    def _suggest_new_account_path(
+        payee: str, sugg: List[Tuple[object, float, str]], fallback_category: str
+    ) -> str:
+        """Suggest a path for a new account. If existing suggestions point
+        at a category (e.g. Expenses:Auto:Parking:Odyssey car park), reuse
+        that top-level category (Expenses:Auto) and append the payee name
+        as the new leaf, e.g. Expenses:Auto:Charing Cross Car Park.
+        Falls back to the keyword-based category guess if there are no
+        suggestions to anchor on."""
+        if sugg:
+            top_account = sugg[0][0]
+            parts = top_account.fullname.split(":")
+            if len(parts) >= 2:
+                category_prefix = ":".join(parts[:2])
+                return f"{category_prefix}:{payee}"
+        return f"{fallback_category}:{payee}"
+
     def get_account_by_guid(self, guid: str) -> Optional[object]:
         return self.accounts_cache.get(guid)
 
@@ -489,9 +545,6 @@ class AccountMatcher:
         return None
 
 
-# --------------------------------------------------------------
-# 5. Main importer class
-# --------------------------------------------------------------
 class TransactionImporter:
     def __init__(self, gnucash_file: str, csv_file: str):
         self.gnucash_file = gnucash_file
@@ -523,20 +576,20 @@ class TransactionImporter:
         d = f"{tx['date']}|{tx['payee']}|{tx['amount']:.2f}"
         return hashlib.md5(d.encode("utf-8")).hexdigest()
 
-    # ----- commodity handling -------------------------------------------------
     def _get_or_create_commodity(self, code: str) -> piecash.Commodity:
-        """Return existing ISO4217 commodity or create it if missing."""
+        """Return existing currency commodity or create it if missing.
+        piecash/GnuCash uses namespace == "CURRENCY" for currency
+        commodities, and `mnemonic` (not `name`) holds the code (e.g. GBP)."""
         code = code.upper()
         if code not in SUPPORTED_CURRENCIES:
             print(f"{code} not supported - falling back to {BASE_CURRENCY}")
             code = BASE_CURRENCY
         for c in self.book.commodities:
-            if c.namespace == "ISO4217" and c.name == code:
+            if c.namespace == "CURRENCY" and c.mnemonic == code:
                 return c
-        # create new
         new_c = piecash.Commodity(
             name=code,
-            namespace="ISO4217",
+            namespace="CURRENCY",
             mnemonic=code,
             fullname=f"{code} Currency",
             quote_source="Manual",
@@ -545,7 +598,6 @@ class TransactionImporter:
         print(f"Created new currency commodity: {code}")
         return new_c
 
-    # ----- open GnuCash book (SQLite via piecash) -----------------------------
     def open_book(self, readonly: bool = True):
         """Open the GnuCash SQLite book via piecash."""
         self.gnucash_file = os.path.abspath(self.gnucash_file)
@@ -558,7 +610,6 @@ class TransactionImporter:
             open_if_lock=True,
         )
 
-    # ----- export account tree to JSON ----------------------------------------
     def export_accounts_json(self, json_path: str = ACCOUNTS_EXPORT_FILE):
         """Dump every account's guid/name/fullname/type/description/currency to JSON."""
         accounts = {}
@@ -577,14 +628,14 @@ class TransactionImporter:
         print(f"Exported {len(accounts)} accounts to {json_path}")
         return accounts
 
-    # ----- read CSV -----------------------------------------------------------
-    def read_csv(self) -> List[dict]:
+    def read_csv(self, skip_pending: bool = True) -> List[dict]:
         if not os.path.exists(self.csv_file):
             raise FileNotFoundError(f"CSV not found: {self.csv_file}")
         fmt = self.mapper.detect_format(self.csv_file)
         print(f"Detected bank format: {fmt}")
 
         rows = []
+        skipped_pending = 0
         with open(self.csv_file, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
             for i, row in enumerate(reader, 1):
@@ -597,15 +648,21 @@ class TransactionImporter:
                         m = self.mapper.map_bof_scot(row)
                     else:
                         m = self.mapper.map_generic(row)
+
+                    if skip_pending and str(m.get("state", "")).upper() == "PENDING":
+                        skipped_pending += 1
+                        continue
+
                     m["row_number"] = i
                     m["import_hash"] = self._tx_hash(m)
                     rows.append(m)
                 except Exception as e:
                     print(f"Row {i}: mapping error - {e}")
+        if skipped_pending:
+            print(f"Skipped {skipped_pending} pending transaction(s) (not yet settled)")
         print(f"Read {len(rows)} transactions")
         return rows
 
-    # ----- main processing loop ---------------------------------------------
     def process_transactions(self, transactions: List[dict]):
         print("\n" + "=" * 70)
         print("TRANSACTION PROCESSING")
@@ -622,12 +679,10 @@ class TransactionImporter:
             if tx.get("memo"):
                 print(f"  Memo: {tx['memo']}")
 
-            # duplicate check
             if tx["import_hash"] in self.imported_tx:
                 print("  Already imported - skipping")
                 continue
 
-            # 1. Try persistent mapping (if currency matches)
             mm = self.payee_mapper.get_mapping(tx["payee"])
             if mm:
                 acct = self.matcher.get_account_by_guid(mm["account_guid"])
@@ -643,7 +698,7 @@ class TransactionImporter:
                             self._prepare_tx(acct, tx)
                             continue
                         elif ans == "edit":
-                            pass  # fall through to manual selection
+                            pass
                     else:
                         print("  [DRY RUN] Would use existing mapping")
                         self._prepare_tx(acct, tx)
@@ -654,7 +709,6 @@ class TransactionImporter:
                         f"{mm['account_fullname']}"
                     )
 
-            # 2. Get history-based suggestions (filtered by currency)
             sugg = self.matcher.find_matching_accounts(
                 tx["payee"], tx.get("memo", ""), transaction_currency=tx["currency"]
             )
@@ -669,7 +723,6 @@ class TransactionImporter:
                 print("\n  No historical matches.")
                 print(f"  Suggested category: {cat}")
 
-            # 3. Manual selection
             if self.dry_run:
                 print("  [DRY RUN] Skipping manual selection")
                 continue
@@ -680,15 +733,17 @@ class TransactionImporter:
             else:
                 print("  Transaction skipped")
 
-    # ----- manual selection UI ------------------------------------------------
     def _manual_sel(
         self, tx: dict, sugg: List[Tuple[object, float, str]]
     ) -> Optional[object]:
         print("\n  Account Selection:")
         for i, (ac, conf, reason) in enumerate(sugg, 1):
             print(f"   {i}. {ac.fullname} ({conf:.0%} confidence)")
-        cat = self.matcher.suggest_category(tx["payee"])
-        print(f"   {len(sugg) + 1}. Create new account (suggested: {cat})")
+        fallback_cat = self.matcher.suggest_category(tx["payee"])
+        suggested_path = self.matcher._suggest_new_account_path(
+            tx["payee"], sugg, fallback_cat
+        )
+        print(f"   {len(sugg) + 1}. Create new account (suggested: {suggested_path})")
         print(f"   {len(sugg) + 2}. Skip this transaction")
         print(f"   {len(sugg) + 3}. Manage mappings")
 
@@ -708,7 +763,7 @@ class TransactionImporter:
             return ac
 
         if ch == len(sugg) + 1:
-            path = input(f"  New account path (default {cat}): ").strip() or cat
+            path = input(f"  New account path (default {suggested_path}): ").strip() or suggested_path
             ac = self._new_acct(path, tx)
             if (
                 ac
@@ -773,7 +828,6 @@ class TransactionImporter:
         except ValueError:
             print("  Invalid input")
 
-    # ----- create new account -------------------------------------------------
     def _new_acct(self, path: str, tx: dict) -> Optional[object]:
         parts = path.split(":")
         if len(parts) < 2:
@@ -822,23 +876,22 @@ class TransactionImporter:
             return "EQUITY"
         return "EXPENSE"
 
-    # ----- prepare a transaction for later creation ---------------------------
     def _prepare_tx(self, acct: object, tx: dict):
         commod = self._get_or_create_commodity(tx["currency"])
-        amt = piecash.Money(tx["amount"], commod)
+        amt = Decimal(str(tx["amount"]))
         self.tx_to_create.append(
             {
                 "account": acct,
                 "date": tx["date"],
                 "payee": tx["payee"],
                 "amount": amt,
+                "commodity": commod,
                 "memo": tx.get("memo", ""),
                 "hash": tx["import_hash"],
             }
         )
         print(f"  Prepared for {acct.fullname} ({tx['currency']})")
 
-    # ----- execute the import -------------------------------------------------
     def execute_import(self):
         if not self.tx_to_create:
             print("  No transactions to import")
@@ -851,8 +904,9 @@ class TransactionImporter:
         created = 0
         for info in self.tx_to_create:
             try:
+                commod = info["commodity"]
                 tx = piecash.Transaction(
-                    currency=info["amount"].currency,
+                    currency=commod,
                     description=info["payee"][:250],
                     splits=[
                         piecash.Split(
@@ -867,12 +921,12 @@ class TransactionImporter:
                     "timestamp": datetime.now().isoformat(),
                     "payee": info["payee"],
                     "amount": str(info["amount"]),
-                    "currency": info["amount"].currency.mnemonic,
+                    "currency": commod.mnemonic,
                     "account": info["account"].fullname,
                 }
                 created += 1
                 print(
-                    f"  {info['payee'][:50]} - {abs(info['amount']):.2f} {info['amount'].currency.mnemonic}"
+                    f"  {info['payee'][:50]} - {abs(info['amount']):.2f} {commod.mnemonic}"
                 )
             except Exception as e:
                 print(f"  Failed {info['payee']}: {e}")
@@ -885,9 +939,6 @@ class TransactionImporter:
             print("\nNo transactions created")
 
 
-# --------------------------------------------------------------
-# 6. CLI entry point
-# --------------------------------------------------------------
 def main():
     import argparse
 
@@ -926,6 +977,11 @@ def main():
         "--export-accounts",
         action="store_true",
         help="Export the account tree to accounts.json and exit",
+    )
+    parser.add_argument(
+        "--include-pending",
+        action="store_true",
+        help="Include PENDING (not-yet-settled) Revolut transactions",
     )
     args = parser.parse_args()
 
@@ -970,13 +1026,11 @@ def main():
             imp.book.close()
             return
 
-        # Build the history analyzer + account matcher BEFORE processing rows --
-        # these were previously left as None, causing an AttributeError.
         imp.history_analyzer = TransactionHistoryAnalyzer(imp.book)
         imp.history_analyzer.analyze_transactions()
         imp.matcher = AccountMatcher(imp.book, imp.payee_mapper, imp.history_analyzer)
 
-        rows = imp.read_csv()
+        rows = imp.read_csv(skip_pending=not args.include_pending)
 
         if not rows:
             print("No transactions in CSV")
