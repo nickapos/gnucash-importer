@@ -8,6 +8,10 @@ Supports GBP (default), USD, and EUR currencies for accounts.
 Works against a SQLite-backed GnuCash book (piecash cannot read/write
 GnuCash XML files directly -- convert via GnuCash's File -> Save As ->
 sqlite3 first if your book is still in XML format).
+
+Every transaction is recorded as a proper double-entry split between the
+SOURCE account (the bank/Revolut account the CSV export belongs to) and the
+DESTINATION account (the expense/income category chosen or suggested).
 """
 
 import csv
@@ -36,6 +40,46 @@ MAPPINGS_FILE = ".payee_account_mappings.json"
 TRANSACTION_HISTORY_FILE = ".transaction_history_analysis.json"
 ACCOUNTS_EXPORT_FILE = "accounts.json"
 SUPPORTED_CURRENCIES = {"GBP", "USD", "EUR"}
+
+
+class AccountPathCompleter:
+    """readline completer that offers existing GnuCash account fullnames
+    as tab-completion candidates when typing an account path."""
+
+    def __init__(self, account_fullnames: List[str]):
+        self.account_fullnames = sorted(set(account_fullnames))
+
+    def complete(self, text: str, state: int) -> Optional[str]:
+        if not text:
+            matches = self.account_fullnames
+        else:
+            matches = [
+                a for a in self.account_fullnames if a.lower().startswith(text.lower())
+            ]
+        try:
+            return matches[state]
+        except IndexError:
+            return None
+
+
+def _input_with_completion(prompt: str, completer: "AccountPathCompleter") -> str:
+    """Prompt for input with tab-completion enabled, falling back to plain
+    input() if readline is unavailable (e.g. some Windows terminals)."""
+    try:
+        import readline
+
+        old_completer = readline.get_completer()
+        old_delims = readline.get_completer_delims()
+        readline.set_completer(completer.complete)
+        readline.set_completer_delims("")
+        readline.parse_and_bind("tab: complete")
+        try:
+            return input(prompt)
+        finally:
+            readline.set_completer(old_completer)
+            readline.set_completer_delims(old_delims)
+    except (ImportError, AttributeError):
+        return input(prompt)
 
 
 class TransactionHistoryAnalyzer:
@@ -131,6 +175,7 @@ class TransactionHistoryAnalyzer:
     def suggest_mapping(
         self, csv_payee: str, csv_description: str = ""
     ) -> List[Tuple[str, float, str]]:
+        """Return [(account_fullname, confidence, reason), ...]"""
         suggestions = []
         payee_l = csv_payee.lower().strip()
         desc_l = csv_description.lower().strip()
@@ -160,11 +205,19 @@ class TransactionHistoryAnalyzer:
         csv_words = set(self._extract_words(csv_payee + " " + csv_description))
         word_scores = defaultdict(float)
         for w in csv_words:
-            for acct, cnt in self.word_patterns.get(w, {}).items():
-                word_scores[acct] += cnt * 0.1
-        matched_words = [w for w in csv_words if w in self.word_patterns]
+            accounts_for_word = self.word_patterns.get(w, {})
+            if not accounts_for_word:
+                continue
+            distinct_accounts = len(accounts_for_word)
+            rarity_weight = 1.0 / distinct_accounts
+            for acct, cnt in accounts_for_word.items():
+                word_scores[acct] += cnt * rarity_weight
+        matched_words = sorted(
+            (w for w in csv_words if w in self.word_patterns),
+            key=lambda w: len(self.word_patterns.get(w, {})),
+        )
         for acct, sc in Counter(word_scores).most_common(5):
-            if sc > 0.3:
+            if sc > 0.15:
                 word_hint = matched_words[0] if matched_words else ""
                 suggestions.append(
                     (
@@ -383,10 +436,8 @@ class AccountMatcher:
 
     @staticmethod
     def _acct_currency_matches(acct: object, code: str) -> bool:
-        """Return True if acct's commodity is a currency matching `code`
-        (case-insensitive). piecash/GnuCash stores currency commodities
-        with namespace == "CURRENCY", not "ISO4217" -- ISO4217 is just the
-        real-world standard name, not the stored value."""
+        """piecash/GnuCash stores currency commodities with namespace ==
+        "CURRENCY", not "ISO4217"."""
         cur = getattr(acct, "commodity", None)
         if not cur:
             return False
@@ -407,11 +458,6 @@ class AccountMatcher:
     def _keyword_account_matches(
         self, payee: str, transaction_currency: str
     ) -> List[Tuple[object, float, str]]:
-        """Token-overlap matching against account NAMES (not transaction
-        history). Catches cases like 'Charing Cross Car Park' matching
-        'Expenses:Auto:Parking:Odyssey car park' via shared words
-        ('car', 'park') even though neither string contains the other,
-        and neither has been seen in a past transaction yet."""
         payee_tokens = self._extract_tokens(payee)
         if not payee_tokens:
             return []
@@ -439,6 +485,7 @@ class AccountMatcher:
         description: str = "",
         transaction_currency: str = BASE_CURRENCY,
         max_suggestions: int = MAX_ACCOUNT_SUGGESTIONS,
+        exclude_guid: Optional[str] = None,
     ) -> List[Tuple[object, float, str]]:
         all_sug = []
 
@@ -473,6 +520,9 @@ class AccountMatcher:
         all_sug.extend(
             self._keyword_account_matches(payee, transaction_currency)
         )
+
+        if exclude_guid:
+            all_sug = [s for s in all_sug if s[0].guid != exclude_guid]
 
         best = {}
         for ac, conf, reason in all_sug:
@@ -521,12 +571,6 @@ class AccountMatcher:
     def _suggest_new_account_path(
         payee: str, sugg: List[Tuple[object, float, str]], fallback_category: str
     ) -> str:
-        """Suggest a path for a new account. If existing suggestions point
-        at a category (e.g. Expenses:Auto:Parking:Odyssey car park), reuse
-        that top-level category (Expenses:Auto) and append the payee name
-        as the new leaf, e.g. Expenses:Auto:Charing Cross Car Park.
-        Falls back to the keyword-based category guess if there are no
-        suggestions to anchor on."""
         if sugg:
             top_account = sugg[0][0]
             parts = top_account.fullname.split(":")
@@ -556,6 +600,8 @@ class TransactionImporter:
         self.matcher = None
         self.imported_tx = self._load_imported()
         self.dry_run = False
+        self.auto_accept = False
+        self.source_account = None
         self.tx_to_create = []
         self.accts_to_create = []
 
@@ -577,9 +623,6 @@ class TransactionImporter:
         return hashlib.md5(d.encode("utf-8")).hexdigest()
 
     def _get_or_create_commodity(self, code: str) -> piecash.Commodity:
-        """Return existing currency commodity or create it if missing.
-        piecash/GnuCash uses namespace == "CURRENCY" for currency
-        commodities, and `mnemonic` (not `name`) holds the code (e.g. GBP)."""
         code = code.upper()
         if code not in SUPPORTED_CURRENCIES:
             print(f"{code} not supported - falling back to {BASE_CURRENCY}")
@@ -599,7 +642,8 @@ class TransactionImporter:
         return new_c
 
     def open_book(self, readonly: bool = True):
-        """Open the GnuCash SQLite book via piecash."""
+        """Open the GnuCash SQLite book via piecash. `readonly` should be
+        True ONLY for --dry-run sessions."""
         self.gnucash_file = os.path.abspath(self.gnucash_file)
         if not os.path.exists(self.gnucash_file):
             raise FileNotFoundError(f"GnuCash file not found: {self.gnucash_file}")
@@ -610,8 +654,44 @@ class TransactionImporter:
             open_if_lock=True,
         )
 
+    def resolve_source_account(self, path_hint: Optional[str] = None) -> object:
+        """Resolve (or interactively select) the GnuCash Asset account that
+        this CSV export's bank statement belongs to. Every imported
+        transaction needs a second, offsetting split against this account
+        so the transaction balances (sum of splits == 0), which GnuCash
+        requires for every transaction."""
+        if path_hint:
+            guid = self.matcher.get_account_guid(path_hint)
+            if guid:
+                acct = self.matcher.get_account_by_guid(guid)
+                print(f"Using source account: {acct.fullname}")
+                return acct
+            print(f"Warning: account '{path_hint}' not found - please select manually.")
+
+        asset_accounts = sorted(
+            (
+                a
+                for a in self.matcher.accounts_cache.values()
+                if a.type == "ASSET" and a.placeholder == 0
+            ),
+            key=lambda a: a.fullname,
+        )
+        print("\nWhich account does this CSV export belong to?")
+        for i, a in enumerate(asset_accounts, 1):
+            print(f"  {i}. {a.fullname} ({a.commodity.mnemonic if a.commodity else '?'})")
+        completer = AccountPathCompleter([a.fullname for a in asset_accounts])
+        while True:
+            choice = _input_with_completion(
+                "Enter number or account path (Tab to autocomplete): ", completer
+            ).strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(asset_accounts):
+                return asset_accounts[int(choice) - 1]
+            guid = self.matcher.get_account_guid(choice)
+            if guid:
+                return self.matcher.get_account_by_guid(guid)
+            print("  Not recognized - try again.")
+
     def export_accounts_json(self, json_path: str = ACCOUNTS_EXPORT_FILE):
-        """Dump every account's guid/name/fullname/type/description/currency to JSON."""
         accounts = {}
         for acct in self.book.accounts:
             accounts[acct.guid] = {
@@ -667,6 +747,7 @@ class TransactionImporter:
         print("\n" + "=" * 70)
         print("TRANSACTION PROCESSING")
         print("=" * 70)
+        print(f"Source account: {self.source_account.fullname}")
 
         for idx, tx in enumerate(transactions, 1):
             print(f"\n[{idx}/{len(transactions)}] Row {tx['row_number']}")
@@ -691,7 +772,16 @@ class TransactionImporter:
                         f"\n  MAPPED: {mm['account_fullname']} "
                         f"(used {mm.get('use_count', 1)} times)"
                     )
-                    if not self.dry_run:
+                    if self.dry_run:
+                        print("  [DRY RUN] Would use existing mapping")
+                        self._prepare_tx(acct, tx)
+                        continue
+                    elif self.auto_accept:
+                        print("  [AUTO-ACCEPT] Using existing mapping")
+                        self.payee_mapper.update_last_used(tx["payee"])
+                        self._prepare_tx(acct, tx)
+                        continue
+                    else:
                         ans = input("  Use this mapping? [Y]/n/edit: ").strip().lower()
                         if ans in ["", "y", "yes"]:
                             self.payee_mapper.update_last_used(tx["payee"])
@@ -699,18 +789,24 @@ class TransactionImporter:
                             continue
                         elif ans == "edit":
                             pass
-                    else:
-                        print("  [DRY RUN] Would use existing mapping")
-                        self._prepare_tx(acct, tx)
-                        continue
+                elif acct is None:
+                    print(
+                        f"  Mapping exists but the account no longer exists in "
+                        f"the book (guid not found): {mm['account_fullname']}. "
+                        f"Removing stale mapping."
+                    )
+                    self.payee_mapper.remove_mapping(tx["payee"])
                 else:
                     print(
-                        f"  Mapping exists but currency mismatch or account gone: "
-                        f"{mm['account_fullname']}"
+                        f"  Mapping exists but currency does not match this "
+                        f"transaction ({tx['currency']}): {mm['account_fullname']}"
                     )
 
             sugg = self.matcher.find_matching_accounts(
-                tx["payee"], tx.get("memo", ""), transaction_currency=tx["currency"]
+                tx["payee"],
+                tx.get("memo", ""),
+                transaction_currency=tx["currency"],
+                exclude_guid=self.source_account.guid,
             )
             if sugg:
                 print("\n  Suggested accounts (filtered by currency):")
@@ -725,6 +821,15 @@ class TransactionImporter:
 
             if self.dry_run:
                 print("  [DRY RUN] Skipping manual selection")
+                continue
+
+            if self.auto_accept:
+                if sugg:
+                    top_acct = sugg[0][0]
+                    print(f"  [AUTO-ACCEPT] Using top suggestion: {top_acct.fullname}")
+                    self._prepare_tx(top_acct, tx)
+                else:
+                    print("  [AUTO-ACCEPT] No suggestions available - skipping transaction")
                 continue
 
             sel = self._manual_sel(tx, sugg)
@@ -744,11 +849,12 @@ class TransactionImporter:
             tx["payee"], sugg, fallback_cat
         )
         print(f"   {len(sugg) + 1}. Create new account (suggested: {suggested_path})")
-        print(f"   {len(sugg) + 2}. Skip this transaction")
-        print(f"   {len(sugg) + 3}. Manage mappings")
+        print(f"   {len(sugg) + 2}. Enter account path manually (tab to autocomplete)")
+        print(f"   {len(sugg) + 3}. Skip this transaction")
+        print(f"   {len(sugg) + 4}. Manage mappings")
 
         try:
-            ch = int(input(f"  Enter choice (1-{len(sugg) + 3}): "))
+            ch = int(input(f"  Enter choice (1-{len(sugg) + 4}): "))
         except ValueError:
             print("  Invalid input - skipping")
             return None
@@ -775,9 +881,35 @@ class TransactionImporter:
             return ac
 
         if ch == len(sugg) + 2:
+            completer = AccountPathCompleter(
+                [a.fullname for a in self.matcher.accounts_cache.values()]
+            )
+            path = _input_with_completion(
+                "  Account path (Tab to autocomplete, Tab-Tab to list options): ",
+                completer,
+            ).strip()
+            if not path:
+                print("  No path entered - skipping")
+                return None
+            existing_guid = self.matcher.get_account_guid(path)
+            if existing_guid:
+                ac = self.matcher.get_account_by_guid(existing_guid)
+                print(f"  Using existing account: {ac.fullname}")
+            else:
+                ac = self._new_acct(path, tx)
+            if (
+                ac
+                and not self.dry_run
+                and input("  Save mapping? [Y]/n: ").strip().lower() in ["", "y", "yes"]
+            ):
+                self.payee_mapper.add_mapping(tx["payee"], ac.fullname, ac.guid)
+                print(f"  Saved mapping: '{tx['payee']}' -> '{ac.fullname}'")
+            return ac
+
+        if ch == len(sugg) + 3:
             print("  Skipped")
             return None
-        if ch == len(sugg) + 3:
+        if ch == len(sugg) + 4:
             self._manage_mappings()
             return self._manual_sel(tx, sugg)
         return None
@@ -829,12 +961,20 @@ class TransactionImporter:
             print("  Invalid input")
 
     def _new_acct(self, path: str, tx: dict) -> Optional[object]:
+        if self.dry_run:
+            print(
+                "  [DRY RUN] Would create account, but skipping actual creation "
+                "(dry-run never persists new accounts)"
+            )
+            return None
+
         parts = path.split(":")
         if len(parts) < 2:
             print("  Path needs at least two parts, e.g. Expenses:Food")
             return None
         parent = None
         cur = ""
+        created_any = False
         for part in parts:
             cur = f"{cur}:{part}" if cur else part
             exist = self.matcher.get_account_guid(cur)
@@ -850,13 +990,23 @@ class TransactionImporter:
                     parent=parent if parent else self.book.root_account,
                     commodity=commod,
                 )
+                self.book.add(new)
                 print(f"  Created {cur} ({tx['currency']})")
                 self.accts_to_create.append(new)
                 self.matcher.accounts_cache[new.guid] = new
                 parent = new
+                created_any = True
             except Exception as e:
                 print(f"  Could not create {cur}: {e}")
                 return None
+
+        if created_any:
+            try:
+                self.book.save()
+                print(f"  Saved new account(s) to {self.gnucash_file}")
+            except Exception as e:
+                print(f"  Warning: could not save new account(s) immediately: {e}")
+
         return parent
 
     @staticmethod
@@ -877,11 +1027,16 @@ class TransactionImporter:
         return "EXPENSE"
 
     def _prepare_tx(self, acct: object, tx: dict):
+        """Prepare a BALANCED double-entry transaction: one split against
+        the source (bank/Revolut) account, one offsetting split against
+        the chosen destination (expense/income) account. GnuCash requires
+        every transaction's splits to sum to zero."""
         commod = self._get_or_create_commodity(tx["currency"])
         amt = Decimal(str(tx["amount"]))
         self.tx_to_create.append(
             {
-                "account": acct,
+                "source_account": self.source_account,
+                "dest_account": acct,
                 "date": tx["date"],
                 "payee": tx["payee"],
                 "amount": amt,
@@ -890,7 +1045,7 @@ class TransactionImporter:
                 "hash": tx["import_hash"],
             }
         )
-        print(f"  Prepared for {acct.fullname} ({tx['currency']})")
+        print(f"  Prepared: {self.source_account.fullname} <-> {acct.fullname} ({tx['currency']})")
 
     def execute_import(self):
         if not self.tx_to_create:
@@ -905,15 +1060,22 @@ class TransactionImporter:
         for info in self.tx_to_create:
             try:
                 commod = info["commodity"]
+                source_value = info["amount"]
+                dest_value = -info["amount"]
                 tx = piecash.Transaction(
                     currency=commod,
                     description=info["payee"][:250],
                     splits=[
                         piecash.Split(
-                            account=info["account"],
-                            value=info["amount"],
+                            account=info["source_account"],
+                            value=source_value,
                             memo=info["memo"][:200],
-                        )
+                        ),
+                        piecash.Split(
+                            account=info["dest_account"],
+                            value=dest_value,
+                            memo=info["memo"][:200],
+                        ),
                     ],
                 )
                 self.book.add(tx)
@@ -922,11 +1084,13 @@ class TransactionImporter:
                     "payee": info["payee"],
                     "amount": str(info["amount"]),
                     "currency": commod.mnemonic,
-                    "account": info["account"].fullname,
+                    "source_account": info["source_account"].fullname,
+                    "dest_account": info["dest_account"].fullname,
                 }
                 created += 1
                 print(
-                    f"  {info['payee'][:50]} - {abs(info['amount']):.2f} {commod.mnemonic}"
+                    f"  {info['payee'][:50]} - {abs(info['amount']):.2f} {commod.mnemonic} "
+                    f"({info['source_account'].fullname} <-> {info['dest_account'].fullname})"
                 )
             except Exception as e:
                 print(f"  Failed {info['payee']}: {e}")
@@ -953,12 +1117,20 @@ def main():
         "--csv-file", default=DEFAULT_CSV_FILE, help="Path to bank CSV export"
     )
     parser.add_argument(
+        "--source-account",
+        default=None,
+        help="Fullname of the GnuCash Asset account this CSV export belongs "
+        "to (e.g. 'Assets:Current Assets:Revolut GBP'). Prompted "
+        "interactively if omitted.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be done without saving"
     )
     parser.add_argument(
         "--auto-accept",
         action="store_true",
-        help="Auto-accept first suggestion for every row",
+        help="Auto-accept the top suggestion for every row without prompting "
+        "(still writes to the book unless combined with --dry-run)",
     )
     parser.add_argument(
         "--list-mappings",
@@ -1017,9 +1189,10 @@ def main():
     try:
         imp = TransactionImporter(args.gnucash_file, args.csv_file)
         imp.dry_run = args.dry_run
+        imp.auto_accept = args.auto_accept
         imp.payee_mapper = payee_mapper
 
-        imp.open_book(readonly=not args.dry_run and not args.auto_accept)
+        imp.open_book(readonly=args.dry_run)
 
         if args.export_accounts:
             imp.export_accounts_json()
@@ -1029,6 +1202,8 @@ def main():
         imp.history_analyzer = TransactionHistoryAnalyzer(imp.book)
         imp.history_analyzer.analyze_transactions()
         imp.matcher = AccountMatcher(imp.book, imp.payee_mapper, imp.history_analyzer)
+
+        imp.source_account = imp.resolve_source_account(args.source_account)
 
         rows = imp.read_csv(skip_pending=not args.include_pending)
 
@@ -1042,7 +1217,9 @@ def main():
         if imp.tx_to_create:
             print(f"\nPrepared {len(imp.tx_to_create)} transactions for import")
             if not args.dry_run:
-                if input("\nExecute import now? [y/N]: ").strip().lower() == "y":
+                if args.auto_accept or input(
+                    "\nExecute import now? [y/N]: "
+                ).strip().lower() == "y":
                     imp.execute_import()
                 else:
                     print("Import cancelled")
