@@ -11,7 +11,8 @@ sqlite3 first if your book is still in XML format).
 
 Every transaction is recorded as a proper double-entry split between the
 SOURCE account (the bank/Revolut account the CSV export belongs to) and the
-DESTINATION account (the expense/income category chosen or suggested).
+DESTINATION account (the expense/income category chosen or suggested), and
+uses the transaction date FROM THE CSV (not the import run date).
 """
 
 import csv
@@ -40,6 +41,35 @@ MAPPINGS_FILE = ".payee_account_mappings.json"
 TRANSACTION_HISTORY_FILE = ".transaction_history_analysis.json"
 ACCOUNTS_EXPORT_FILE = "accounts.json"
 SUPPORTED_CURRENCIES = {"GBP", "USD", "EUR"}
+
+
+def parse_tx_date(date_str: str) -> datetime:
+    """Parse a CSV date string into a datetime, trying several common
+    formats (Revolut's 'YYYY-MM-DD HH:MM:SS', plain 'YYYY-MM-DD', and
+    UK-style 'DD/MM/YYYY' as used by some bank exports). Only falls back
+    to now() if the string is empty or genuinely unparseable, and always
+    prints a warning so the mismatch is visible rather than silent."""
+    date_str = (date_str or "").strip()
+    if not date_str:
+        print("  Warning: empty date field - using current date/time as fallback")
+        return datetime.now()
+
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+
+    print(f"  Warning: could not parse date '{date_str}' - using current date/time as fallback")
+    return datetime.now()
 
 
 class AccountPathCompleter:
@@ -436,8 +466,6 @@ class AccountMatcher:
 
     @staticmethod
     def _acct_currency_matches(acct: object, code: str) -> bool:
-        """piecash/GnuCash stores currency commodities with namespace ==
-        "CURRENCY", not "ISO4217"."""
         cur = getattr(acct, "commodity", None)
         if not cur:
             return False
@@ -642,8 +670,6 @@ class TransactionImporter:
         return new_c
 
     def open_book(self, readonly: bool = True):
-        """Open the GnuCash SQLite book via piecash. `readonly` should be
-        True ONLY for --dry-run sessions."""
         self.gnucash_file = os.path.abspath(self.gnucash_file)
         if not os.path.exists(self.gnucash_file):
             raise FileNotFoundError(f"GnuCash file not found: {self.gnucash_file}")
@@ -655,11 +681,6 @@ class TransactionImporter:
         )
 
     def resolve_source_account(self, path_hint: Optional[str] = None) -> object:
-        """Resolve (or interactively select) the GnuCash Asset account that
-        this CSV export's bank statement belongs to. Every imported
-        transaction needs a second, offsetting split against this account
-        so the transaction balances (sum of splits == 0), which GnuCash
-        requires for every transaction."""
         if path_hint:
             guid = self.matcher.get_account_guid(path_hint)
             if guid:
@@ -1029,8 +1050,9 @@ class TransactionImporter:
     def _prepare_tx(self, acct: object, tx: dict):
         """Prepare a BALANCED double-entry transaction: one split against
         the source (bank/Revolut) account, one offsetting split against
-        the chosen destination (expense/income) account. GnuCash requires
-        every transaction's splits to sum to zero."""
+        the chosen destination (expense/income) account. Keeps the raw
+        CSV date string so execute_import() can parse and apply it as the
+        transaction's real post_date instead of defaulting to today."""
         commod = self._get_or_create_commodity(tx["currency"])
         amt = Decimal(str(tx["amount"]))
         self.tx_to_create.append(
@@ -1045,7 +1067,7 @@ class TransactionImporter:
                 "hash": tx["import_hash"],
             }
         )
-        print(f"  Prepared: {self.source_account.fullname} <-> {acct.fullname} ({tx['currency']})")
+        print(f"  Prepared: {self.source_account.fullname} <-> {acct.fullname} ({tx['currency']}) dated {tx['date']}")
 
     def execute_import(self):
         if not self.tx_to_create:
@@ -1062,9 +1084,12 @@ class TransactionImporter:
                 commod = info["commodity"]
                 source_value = info["amount"]
                 dest_value = -info["amount"]
+                post_date = parse_tx_date(info["date"])
                 tx = piecash.Transaction(
                     currency=commod,
                     description=info["payee"][:250],
+                    post_date=post_date.date(),
+                    enter_date=datetime.now(),
                     splits=[
                         piecash.Split(
                             account=info["source_account"],
@@ -1086,10 +1111,13 @@ class TransactionImporter:
                     "currency": commod.mnemonic,
                     "source_account": info["source_account"].fullname,
                     "dest_account": info["dest_account"].fullname,
+                    "csv_date": info["date"],
+                    "tx_guid": tx.guid,
                 }
                 created += 1
                 print(
                     f"  {info['payee'][:50]} - {abs(info['amount']):.2f} {commod.mnemonic} "
+                    f"on {post_date.date()} "
                     f"({info['source_account'].fullname} <-> {info['dest_account'].fullname})"
                 )
             except Exception as e:
@@ -1186,6 +1214,7 @@ def main():
             print("No cache found")
         return
 
+    imp = None
     try:
         imp = TransactionImporter(args.gnucash_file, args.csv_file)
         imp.dry_run = args.dry_run
@@ -1196,7 +1225,6 @@ def main():
 
         if args.export_accounts:
             imp.export_accounts_json()
-            imp.book.close()
             return
 
         imp.history_analyzer = TransactionHistoryAnalyzer(imp.book)
@@ -1209,7 +1237,6 @@ def main():
 
         if not rows:
             print("No transactions in CSV")
-            imp.book.close()
             return
 
         imp.process_transactions(rows)
@@ -1226,8 +1253,6 @@ def main():
         else:
             print("\n[DRY RUN] Run again without --dry-run to execute")
 
-        imp.book.close()
-
     except KeyboardInterrupt:
         print("\nCancelled by user")
     except Exception as e:
@@ -1235,6 +1260,13 @@ def main():
         import traceback
 
         traceback.print_exc()
+    finally:
+        if imp is not None and imp.book is not None:
+            try:
+                imp.book.close()
+                print("GnuCash book closed - lock released.")
+            except Exception as close_err:
+                print(f"Warning: could not cleanly close book: {close_err}")
 
 
 if __name__ == "__main__":
