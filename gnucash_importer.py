@@ -13,6 +13,9 @@ Every transaction is recorded as a proper double-entry split between the
 SOURCE account (the bank/Revolut account the CSV export belongs to) and the
 DESTINATION account (the expense/income category chosen or suggested), and
 uses the transaction date FROM THE CSV (not the import run date).
+
+Transactions can be permanently skipped (marked as "imported" without ever
+creating a real GnuCash transaction) so they never resurface on future runs.
 """
 
 import csv
@@ -650,6 +653,24 @@ class TransactionImporter:
         d = f"{tx['date']}|{tx['payee']}|{tx['amount']:.2f}"
         return hashlib.md5(d.encode("utf-8")).hexdigest()
 
+    def _mark_skipped(self, tx: dict, reason: str = "user skipped"):
+        """Record a transaction as permanently skipped WITHOUT creating a
+        real GnuCash transaction. Uses the same import_hash-based
+        duplicate-check mechanism as genuine imports, so it will never be
+        re-presented on future runs, but is clearly distinguishable in the
+        JSON record (skipped=True, no tx_guid/accounts) from a real import."""
+        self.imported_tx[tx["import_hash"]] = {
+            "timestamp": datetime.now().isoformat(),
+            "payee": tx["payee"],
+            "amount": f"{tx['amount']:.2f}",
+            "currency": tx["currency"],
+            "csv_date": tx["date"],
+            "skipped": True,
+            "reason": reason,
+        }
+        self._save_imported()
+        print(f"  Marked as imported (skipped): '{tx['payee']}' will not be shown again")
+
     def _get_or_create_commodity(self, code: str) -> piecash.Commodity:
         code = code.upper()
         if code not in SUPPORTED_CURRENCIES:
@@ -782,7 +803,11 @@ class TransactionImporter:
                 print(f"  Memo: {tx['memo']}")
 
             if tx["import_hash"] in self.imported_tx:
-                print("  Already imported - skipping")
+                record = self.imported_tx[tx["import_hash"]]
+                if record.get("skipped"):
+                    print("  Already marked as skipped/imported - skipping")
+                else:
+                    print("  Already imported - skipping")
                 continue
 
             mm = self.payee_mapper.get_mapping(tx["payee"])
@@ -850,14 +875,16 @@ class TransactionImporter:
                     print(f"  [AUTO-ACCEPT] Using top suggestion: {top_acct.fullname}")
                     self._prepare_tx(top_acct, tx)
                 else:
-                    print("  [AUTO-ACCEPT] No suggestions available - skipping transaction")
+                    print("  [AUTO-ACCEPT] No suggestions available - marking as skipped/imported")
+                    self._mark_skipped(tx, reason="auto-accept: no suggestions available")
                 continue
 
             sel = self._manual_sel(tx, sugg)
             if sel:
                 self._prepare_tx(sel, tx)
-            else:
-                print("  Transaction skipped")
+            # _manual_sel already handles the two skip variants internally
+            # (mark-as-imported vs. ask-again-next-time), printing its own
+            # status message, so no extra "Transaction skipped" print here.
 
     def _manual_sel(
         self, tx: dict, sugg: List[Tuple[object, float, str]]
@@ -871,13 +898,14 @@ class TransactionImporter:
         )
         print(f"   {len(sugg) + 1}. Create new account (suggested: {suggested_path})")
         print(f"   {len(sugg) + 2}. Enter account path manually (tab to autocomplete)")
-        print(f"   {len(sugg) + 3}. Skip this transaction")
-        print(f"   {len(sugg) + 4}. Manage mappings")
+        print(f"   {len(sugg) + 3}. Skip and mark as imported (never ask again)")
+        print(f"   {len(sugg) + 4}. Skip for now (ask again next run)")
+        print(f"   {len(sugg) + 5}. Manage mappings")
 
         try:
-            ch = int(input(f"  Enter choice (1-{len(sugg) + 4}): "))
+            ch = int(input(f"  Enter choice (1-{len(sugg) + 5}): "))
         except ValueError:
-            print("  Invalid input - skipping")
+            print("  Invalid input - skip for now (ask again next run)")
             return None
 
         if 1 <= ch <= len(sugg):
@@ -910,7 +938,7 @@ class TransactionImporter:
                 completer,
             ).strip()
             if not path:
-                print("  No path entered - skipping")
+                print("  No path entered - skipping for now")
                 return None
             existing_guid = self.matcher.get_account_guid(path)
             if existing_guid:
@@ -928,9 +956,17 @@ class TransactionImporter:
             return ac
 
         if ch == len(sugg) + 3:
-            print("  Skipped")
+            if self.dry_run:
+                print("  [DRY RUN] Would mark as skipped/imported (not persisted in dry-run)")
+            else:
+                self._mark_skipped(tx, reason="user skipped and marked as imported")
             return None
+
         if ch == len(sugg) + 4:
+            print("  Skipped for now (will be shown again next run)")
+            return None
+
+        if ch == len(sugg) + 5:
             self._manage_mappings()
             return self._manual_sel(tx, sugg)
         return None
@@ -1050,9 +1086,7 @@ class TransactionImporter:
     def _prepare_tx(self, acct: object, tx: dict):
         """Prepare a BALANCED double-entry transaction: one split against
         the source (bank/Revolut) account, one offsetting split against
-        the chosen destination (expense/income) account. Keeps the raw
-        CSV date string so execute_import() can parse and apply it as the
-        transaction's real post_date instead of defaulting to today."""
+        the chosen destination (expense/income) account."""
         commod = self._get_or_create_commodity(tx["currency"])
         amt = Decimal(str(tx["amount"]))
         self.tx_to_create.append(

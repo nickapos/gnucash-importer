@@ -6,18 +6,13 @@ Validates previously-imported GnuCash transactions against their source
 CSV rows, and lets you fix mismatches (most commonly: wrong post_date from
 before the date-parsing bug was fixed in gnucash_importer.py).
 
-For each row in the CSV:
-  1. Recompute the same import_hash used by gnucash_importer.py.
-  2. Look it up in .imported_transactions.json to find which GnuCash
-     transaction (by guid) it created.
-  3. Open the live GnuCash book and compare the transaction's actual
-     post_date against what the CSV says it should be.
-  4. Report any mismatches. With --fix, correct post_date (and re-save)
-     for any transaction whose date is wrong.
-
-Must be run from the same directory as gnucash_importer.py (it imports
-shared parsing logic from it directly, so hashes and date-parsing stay
-perfectly consistent between the importer and the validator).
+Recognizes three kinds of records in .imported_transactions.json:
+  1. Genuine imports (have tx_guid) -- verified against the live book.
+  2. Skipped-and-marked-as-imported rows (skipped=True) -- reported as
+     intentionally skipped, never flagged as a mismatch.
+  3. Legacy imports from before tx_guid tracking existed -- flagged as
+     unverifiable, since there is no reliable way to find the matching
+     GnuCash transaction automatically.
 
 Usage:
     python validate_import.py --gnucash-file="portfolio-sqlite.gnucash" --csv-file="transactions.csv"
@@ -102,6 +97,8 @@ def main():
     )
 
     checked = 0
+    skipped_count = 0
+    legacy_count = 0
     mismatches = []
     not_found = []
 
@@ -112,15 +109,20 @@ def main():
                 not_found.append(row)
                 continue
 
+            if record.get("skipped"):
+                skipped_count += 1
+                continue
+
             checked += 1
             tx_guid = record.get("tx_guid")
             expected_date = parse_tx_date(row["date"]).date()
 
             if not tx_guid:
+                legacy_count += 1
                 print(
-                    f"Row {row['row_number']} ('{row['payee']}'): imported but no "
-                    f"tx_guid recorded (imported before this validation tool existed) "
-                    f"- cannot verify automatically. Expected date: {expected_date}"
+                    f"Row {row['row_number']} ('{row['payee']}'): imported before "
+                    f"tx_guid tracking existed - cannot verify automatically. "
+                    f"Expected date: {expected_date}"
                 )
                 continue
 
@@ -141,6 +143,8 @@ def main():
                 )
 
         print(f"\nChecked {checked} previously-imported rows.")
+        print(f"  {skipped_count} row(s) were intentionally skipped-and-marked-imported.")
+        print(f"  {legacy_count} row(s) are legacy imports without tx_guid (unverifiable).")
         print(f"Found {len(mismatches)} date mismatch(es).")
         if not_found:
             print(
