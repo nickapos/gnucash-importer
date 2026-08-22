@@ -40,7 +40,11 @@ NOTE: Source-account selection considers ALL of GnuCash's asset-like
 account types (ASSET, BANK, CASH, CHECKING, STOCK, MUTUAL, RECEIVABLE) --
 not just the literal "ASSET" type -- since GnuCash's own account-creation
 wizard often assigns bank/savings accounts the distinct "BANK" type rather
-than the generic "ASSET" type, even though both represent things you own.
+than the generic "ASSET" type. It also EXCLUDES GnuCash's internal
+bookkeeping artifacts: Orphan-<CURRENCY> accounts (auto-created when a
+transaction has a missing/unresolved split) and Scheduled-Transaction
+template accounts (identified by commodity namespace == "template" and
+named with a random GUID) -- neither of these is a real bank account.
 It also supports searching/filtering by name if an account isn't in the
 default postable-only list.
 """
@@ -99,6 +103,24 @@ BOS_TYPE_DESCRIPTIONS = {
 }
 
 ALPHA_GR_HEADER_MARKER = "Α/Α"
+
+
+def _is_real_asset_account(acct) -> bool:
+    """Exclude GnuCash's internal bookkeeping accounts that are not real
+    bank/asset accounts a CSV export could belong to:
+      - Template accounts (used internally by Scheduled Transactions,
+        identified by commodity.namespace == "template" and named with
+        a random GUID) -- see piecash's Account.is_template property.
+      - Orphan-<CURRENCY> accounts, which GnuCash auto-creates whenever a
+        transaction is entered with a missing/unresolved split account
+        (e.g. from an imperfect prior import). These hold "parked" money
+        that should be reclassified manually, not a genuine account."""
+    commod = getattr(acct, "commodity", None)
+    if commod is not None and getattr(commod, "namespace", "") == "template":
+        return False
+    if acct.fullname.split(":")[-1].startswith("Orphan-"):
+        return False
+    return True
 
 
 def parse_tx_date(date_str: str) -> datetime:
@@ -876,12 +898,12 @@ class TransactionImporter:
         """Resolve (or interactively select) the GnuCash account that this
         CSV export's bank statement belongs to. Considers ALL asset-like
         account types (ASSET, BANK, CASH, CHECKING, STOCK, MUTUAL,
-        RECEIVABLE) -- not just the literal "ASSET" type -- since
-        GnuCash's own account-creation wizard often assigns savings/
-        checking accounts the distinct "BANK" type. Falls back to a
-        case-insensitive substring search across ALL such accounts
-        (including placeholders, which are clearly labelled) if path_hint
-        is not an exact match."""
+        RECEIVABLE) -- not just the literal "ASSET" type. Excludes
+        GnuCash's internal Orphan-<CURRENCY> and Scheduled-Transaction
+        template accounts, since neither is a real bank account. Falls
+        back to a case-insensitive substring search across ALL such
+        accounts (including placeholders, which are clearly labelled) if
+        path_hint is not an exact match."""
         if path_hint:
             guid = self.matcher.get_account_guid(path_hint)
             if guid:
@@ -891,7 +913,8 @@ class TransactionImporter:
             print(f"Warning: account '{path_hint}' not found - please select manually.")
 
         all_asset_accounts = [
-            a for a in self.matcher.accounts_cache.values() if a.type in ASSET_LIKE_TYPES
+            a for a in self.matcher.accounts_cache.values()
+            if a.type in ASSET_LIKE_TYPES and _is_real_asset_account(a)
         ]
         postable_accounts = sorted(
             (a for a in all_asset_accounts if a.placeholder == 0),
@@ -901,7 +924,8 @@ class TransactionImporter:
 
         print(
             f"\nFound {len(all_asset_accounts)} asset-like accounts total "
-            f"({len(postable_accounts)} postable, {placeholder_count} placeholder/organizational)."
+            f"({len(postable_accounts)} postable, {placeholder_count} placeholder/organizational). "
+            f"(Orphan and Scheduled-Transaction template accounts are excluded.)"
         )
         print("Which account does this CSV export belong to?")
         for i, a in enumerate(postable_accounts, 1):
