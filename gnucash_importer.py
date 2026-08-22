@@ -16,6 +16,33 @@ uses the transaction date FROM THE CSV (not the import run date).
 
 Transactions can be permanently skipped (marked as "imported" without ever
 creating a real GnuCash transaction) so they never resurface on future runs.
+
+Before processing, the importer also cross-checks each CSV row against
+transactions ALREADY PRESENT in the GnuCash book on the chosen source
+account (matching on date + amount), catching duplicates that were never
+imported by this script -- e.g. manually entered transactions, or ones
+imported via GnuCash's own bank-import feature.
+
+Supports Revolut, Bank of Scotland, and Alpha Bank (Greece) CSV exports
+natively, plus a generic fallback for other bank formats with date/payee/
+amount columns.
+
+NOTE: Bank of Scotland statements are typically downloaded as PDF -- to use
+this importer you must export the transaction history as CSV from your
+online banking portal.
+
+NOTE: Alpha Bank exports use semicolon (;) delimiters, Greek column headers,
+European number formatting (dot=thousands, comma=decimal), and a few rows
+of account metadata BEFORE the real header row -- all of this is handled
+automatically.
+
+NOTE: Source-account selection considers ALL of GnuCash's asset-like
+account types (ASSET, BANK, CASH, CHECKING, STOCK, MUTUAL, RECEIVABLE) --
+not just the literal "ASSET" type -- since GnuCash's own account-creation
+wizard often assigns bank/savings accounts the distinct "BANK" type rather
+than the generic "ASSET" type, even though both represent things you own.
+It also supports searching/filtering by name if an account isn't in the
+default postable-only list.
 """
 
 import csv
@@ -45,12 +72,41 @@ TRANSACTION_HISTORY_FILE = ".transaction_history_analysis.json"
 ACCOUNTS_EXPORT_FILE = "accounts.json"
 SUPPORTED_CURRENCIES = {"GBP", "USD", "EUR"}
 
+# GnuCash's own account-creation wizard assigns distinct top-level types
+# to different kinds of "things you own" -- ASSET is only the generic
+# catch-all. BANK, CASH, CHECKING, STOCK, MUTUAL, and RECEIVABLE are all
+# equally valid asset-side types that a source account might carry.
+ASSET_LIKE_TYPES = {"ASSET", "BANK", "CASH", "CHECKING", "STOCK", "MUTUAL", "RECEIVABLE"}
+
+BOS_TYPE_DESCRIPTIONS = {
+    "BGC": "Bank Giro Credit",
+    "BP": "Bill Payment",
+    "CHG": "Charge",
+    "CHQ": "Cheque",
+    "COR": "Correction",
+    "CPT": "Cashpoint",
+    "DD": "Direct Debit",
+    "DEB": "Debit Card",
+    "DEP": "Deposit",
+    "FEE": "Fixed Service Fee",
+    "FPI": "Faster Payment In",
+    "FPO": "Faster Payment Out",
+    "MPI": "Mobile Payment In",
+    "MPO": "Mobile Payment Out",
+    "PAY": "Payment",
+    "SO": "Standing Order",
+    "TFR": "Transfer",
+}
+
+ALPHA_GR_HEADER_MARKER = "Α/Α"
+
 
 def parse_tx_date(date_str: str) -> datetime:
     """Parse a CSV date string into a datetime, trying several common
-    formats (Revolut's 'YYYY-MM-DD HH:MM:SS', plain 'YYYY-MM-DD', and
-    UK-style 'DD/MM/YYYY' as used by some bank exports). Only falls back
-    to now() if the string is empty or genuinely unparseable, and always
+    formats: Revolut's 'YYYY-MM-DD HH:MM:SS', Bank of Scotland's
+    'DD Mon YY' (e.g. '03 Aug 26'), Alpha Bank's 'DD/MM/YYYY', plain
+    'YYYY-MM-DD', and generic UK-style 'DD/MM/YYYY'. Only falls back to
+    now() if the string is empty or genuinely unparseable, and always
     prints a warning so the mismatch is visible rather than silent."""
     date_str = (date_str or "").strip()
     if not date_str:
@@ -61,6 +117,9 @@ def parse_tx_date(date_str: str) -> datetime:
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d",
+        "%d %b %y",
+        "%d %b %Y",
+        "%d-%b-%y",
         "%d/%m/%Y %H:%M:%S",
         "%d/%m/%Y",
         "%d-%m-%Y",
@@ -388,20 +447,60 @@ class BankFormatMapper:
 
     @staticmethod
     def map_bof_scot(row: dict) -> dict:
-        date_str = row.get("Posting Date") or row.get("Value Date", "")
-        raw = row.get("Debit") or row.get("Credit")
-        if raw:
-            amt = float(str(raw).replace("£", "").replace(",", ".").strip())
-            sign = -1 if row.get("Debit") else 1
-        else:
-            amt = 0.0
-            sign = 1
+        date_str = row.get("Date") or row.get("Posting Date") or row.get("Value Date", "")
+        payee = row.get("Description") or row.get("Payee", "")
+        type_code = (row.get("Type") or "").strip().upper()
+
+        def _clean_amount(raw: str) -> float:
+            raw = (raw or "").strip()
+            if not raw or raw.lower() == "blank":
+                return 0.0
+            try:
+                return float(raw.replace("£", "").replace(",", ""))
+            except ValueError:
+                return 0.0
+
+        money_in = _clean_amount(row.get("Money In (£)") or row.get("Money In") or row.get("Credit"))
+        money_out = _clean_amount(row.get("Money Out (£)") or row.get("Money Out") or row.get("Debit"))
+        amount = money_in - money_out
+
+        type_desc = BOS_TYPE_DESCRIPTIONS.get(type_code, type_code)
+        memo_parts = [p for p in [type_desc] if p]
+
         return {
             "date": date_str,
-            "payee": row.get("Description") or row.get("Payee", ""),
-            "amount": amt * sign,
-            "currency": row.get("Currency", "").upper() or BASE_CURRENCY,
-            "memo": row.get("Reference") or row.get("Notes", ""),
+            "payee": payee,
+            "amount": amount,
+            "currency": BASE_CURRENCY,
+            "memo": " / ".join(memo_parts) if memo_parts else (row.get("Reference") or row.get("Notes", "")),
+            "original_row": row,
+        }
+
+    @staticmethod
+    def map_alpha_gr(row: dict) -> dict:
+        date_str = row.get("Ημ/νία") or ""
+        payee = row.get("Αιτιολογία") or ""
+        raw_amount = row.get("Ποσό") or "0"
+        sign_code = (row.get("Πρόσημο ποσού") or "").strip().upper()
+        ref = row.get("Αρ. συναλλαγής") or ""
+
+        cleaned = raw_amount.strip().replace(".", "").replace(",", ".")
+        try:
+            amount = float(cleaned)
+        except ValueError:
+            amount = 0.0
+
+        if sign_code == "Χ":
+            amount = -abs(amount)
+        elif sign_code == "Π":
+            amount = abs(amount)
+
+        return {
+            "date": date_str,
+            "payee": payee,
+            "amount": amount,
+            "currency": "EUR",
+            "memo": f"Ref: {ref}" if ref else "",
             "original_row": row,
         }
 
@@ -409,7 +508,16 @@ class BankFormatMapper:
     def detect_format(csv_file: str) -> str:
         try:
             with open(csv_file, "r", encoding="utf-8-sig", newline="") as f:
+                for _ in range(10):
+                    line = f.readline()
+                    if not line:
+                        break
+                    if line.strip().startswith(ALPHA_GR_HEADER_MARKER):
+                        return "alpha_gr"
+
+                f.seek(0)
                 header = next(csv.reader(f))
+
             hl = [h.strip().lower() for h in header]
             ho = [h.strip() for h in header]
 
@@ -419,8 +527,13 @@ class BankFormatMapper:
             ) >= 2:
                 return "revolut"
 
+            bof_scot_signals = ["money in", "money out", "balance"]
             if any("posting date" == h.lower() for h in ho) or any(
                 "posting date" in h for h in hl
+            ):
+                return "bof_scot"
+            if sum(any(sig in h for sig in bof_scot_signals) for h in hl) >= 2 and any(
+                "type" in h for h in hl
             ):
                 return "bof_scot"
 
@@ -596,6 +709,10 @@ class AccountMatcher:
             for w in ["electric", "gas", "water", "broadband", "internet", "phone", "utilities", "council"]
         ):
             return "Expenses:Utilities"
+        if any(w in pl for w in ["vodafone", "cosmote", "wind", "nova"]):
+            return "Expenses:Phone"
+        if "iris" in pl or "δει" in pl or "vοdαfονε" in pl:
+            return "Expenses:Utilities"
         return "Expenses:Miscellaneous"
 
     @staticmethod
@@ -635,6 +752,8 @@ class TransactionImporter:
         self.source_account = None
         self.tx_to_create = []
         self.accts_to_create = []
+        self._existing_ledger_index = None
+        self.check_ledger = True
 
     def _load_imported(self) -> dict:
         if os.path.exists(DUPLICATE_CHECK_FILE):
@@ -671,6 +790,58 @@ class TransactionImporter:
         self._save_imported()
         print(f"  Marked as imported (skipped): '{tx['payee']}' will not be shown again")
 
+    def _build_existing_ledger_index(self):
+        """Build a lookup index of transactions ALREADY present in the
+        GnuCash book, keyed by (post_date, signed amount on the source
+        account's split). This catches duplicates that were NOT created
+        by this importer -- e.g. transactions entered manually in GnuCash,
+        imported via GnuCash's own bank-import feature, or migrated from
+        another tool -- which the import_hash-based check alone cannot
+        see, since that only tracks what THIS script has previously
+        written to .imported_transactions.json.
+
+        Only considers splits against self.source_account, since that is
+        the leg whose sign directly matches the CSV's amount convention
+        (the destination-account leg would have the opposite sign and
+        cause false matches otherwise)."""
+        index = defaultdict(list)
+        for txn in self.book.transactions:
+            if not txn.splits:
+                continue
+            for split in txn.splits:
+                if split.account is not None and split.account.guid == self.source_account.guid:
+                    key = (txn.post_date, round(float(split.value), 2))
+                    index[key].append(txn)
+        self._existing_ledger_index = index
+        print(
+            f"Indexed {sum(len(v) for v in index.values())} existing ledger "
+            f"entries on {self.source_account.fullname} for duplicate detection"
+        )
+
+    def _find_existing_ledger_match(self, tx: dict) -> Optional[object]:
+        """Return a matching existing GnuCash transaction for this CSV row,
+        if one is found in the ledger index built by
+        _build_existing_ledger_index(). Matches on exact (date, amount);
+        if multiple candidates share that key, prefers the one whose
+        description is most textually similar to the CSV payee."""
+        if not self._existing_ledger_index:
+            return None
+        post_date = parse_tx_date(tx["date"]).date()
+        key = (post_date, round(float(tx["amount"]), 2))
+        candidates = self._existing_ledger_index.get(key, [])
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        payee_l = tx["payee"].lower().strip()
+        best = max(
+            candidates,
+            key=lambda t: difflib.SequenceMatcher(
+                None, payee_l, (t.description or "").lower().strip()
+            ).ratio(),
+        )
+        return best
+
     def _get_or_create_commodity(self, code: str) -> piecash.Commodity:
         code = code.upper()
         if code not in SUPPORTED_CURRENCIES:
@@ -702,6 +873,15 @@ class TransactionImporter:
         )
 
     def resolve_source_account(self, path_hint: Optional[str] = None) -> object:
+        """Resolve (or interactively select) the GnuCash account that this
+        CSV export's bank statement belongs to. Considers ALL asset-like
+        account types (ASSET, BANK, CASH, CHECKING, STOCK, MUTUAL,
+        RECEIVABLE) -- not just the literal "ASSET" type -- since
+        GnuCash's own account-creation wizard often assigns savings/
+        checking accounts the distinct "BANK" type. Falls back to a
+        case-insensitive substring search across ALL such accounts
+        (including placeholders, which are clearly labelled) if path_hint
+        is not an exact match."""
         if path_hint:
             guid = self.matcher.get_account_guid(path_hint)
             if guid:
@@ -710,28 +890,78 @@ class TransactionImporter:
                 return acct
             print(f"Warning: account '{path_hint}' not found - please select manually.")
 
-        asset_accounts = sorted(
-            (
-                a
-                for a in self.matcher.accounts_cache.values()
-                if a.type == "ASSET" and a.placeholder == 0
-            ),
+        all_asset_accounts = [
+            a for a in self.matcher.accounts_cache.values() if a.type in ASSET_LIKE_TYPES
+        ]
+        postable_accounts = sorted(
+            (a for a in all_asset_accounts if a.placeholder == 0),
             key=lambda a: a.fullname,
         )
-        print("\nWhich account does this CSV export belong to?")
-        for i, a in enumerate(asset_accounts, 1):
+        placeholder_count = len(all_asset_accounts) - len(postable_accounts)
+
+        print(
+            f"\nFound {len(all_asset_accounts)} asset-like accounts total "
+            f"({len(postable_accounts)} postable, {placeholder_count} placeholder/organizational)."
+        )
+        print("Which account does this CSV export belong to?")
+        for i, a in enumerate(postable_accounts, 1):
             print(f"  {i}. {a.fullname} ({a.commodity.mnemonic if a.commodity else '?'})")
-        completer = AccountPathCompleter([a.fullname for a in asset_accounts])
+        print(
+            "  Type a search term (e.g. 'alpha') to filter/search ALL asset-like "
+            "accounts, including placeholders, if you don't see the right one above."
+        )
+
+        completer = AccountPathCompleter([a.fullname for a in postable_accounts])
         while True:
             choice = _input_with_completion(
-                "Enter number or account path (Tab to autocomplete): ", completer
+                "Enter number, exact account path (Tab to autocomplete), or search term: ",
+                completer,
             ).strip()
-            if choice.isdigit() and 1 <= int(choice) <= len(asset_accounts):
-                return asset_accounts[int(choice) - 1]
+
+            if choice.isdigit() and 1 <= int(choice) <= len(postable_accounts):
+                return postable_accounts[int(choice) - 1]
+
             guid = self.matcher.get_account_guid(choice)
             if guid:
-                return self.matcher.get_account_by_guid(guid)
-            print("  Not recognized - try again.")
+                acct = self.matcher.get_account_by_guid(guid)
+                if acct.placeholder != 0:
+                    print(
+                        f"  '{acct.fullname}' is a placeholder/organizational "
+                        f"account and cannot directly hold transactions. Its "
+                        f"sub-accounts are:"
+                    )
+                    children = [
+                        a for a in all_asset_accounts
+                        if a.parent is not None and a.parent.guid == acct.guid
+                    ]
+                    for child in sorted(children, key=lambda a: a.fullname):
+                        marker = " (placeholder)" if child.placeholder != 0 else ""
+                        print(f"    - {child.fullname}{marker}")
+                    continue
+                return acct
+
+            search_term = choice.lower()
+            matches = [
+                a for a in all_asset_accounts if search_term in a.fullname.lower()
+            ]
+            if not matches:
+                print(f"  No asset-like accounts found matching '{choice}' - try again.")
+                continue
+
+            print(f"\n  Found {len(matches)} account(s) matching '{choice}':")
+            for i, a in enumerate(matches, 1):
+                marker = " (placeholder - cannot hold transactions directly)" if a.placeholder != 0 else ""
+                print(f"    {i}. {a.fullname} [{a.type}] ({a.commodity.mnemonic if a.commodity else '?'}){marker}")
+            sub_choice = input("  Enter number to select, or press Enter to search again: ").strip()
+            if sub_choice.isdigit() and 1 <= int(sub_choice) <= len(matches):
+                selected = matches[int(sub_choice) - 1]
+                if selected.placeholder != 0:
+                    print(
+                        f"  '{selected.fullname}' is a placeholder and cannot "
+                        f"be used directly - please pick one of its sub-accounts instead."
+                    )
+                    continue
+                return selected
 
     def export_accounts_json(self, json_path: str = ACCOUNTS_EXPORT_FILE):
         accounts = {}
@@ -756,30 +986,43 @@ class TransactionImporter:
         fmt = self.mapper.detect_format(self.csv_file)
         print(f"Detected bank format: {fmt}")
 
+        delimiter = ";" if fmt == "alpha_gr" else ","
+
         rows = []
         skipped_pending = 0
         with open(self.csv_file, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for i, row in enumerate(reader, 1):
-                if not any(str(v).strip() for v in row.values()):
+            lines = f.readlines()
+
+        start_idx = 0
+        if fmt == "alpha_gr":
+            for i, line in enumerate(lines):
+                if line.strip().startswith(ALPHA_GR_HEADER_MARKER):
+                    start_idx = i
+                    break
+
+        reader = csv.DictReader(lines[start_idx:], delimiter=delimiter)
+        for i, row in enumerate(reader, 1):
+            if not any(str(v).strip() for v in row.values()):
+                continue
+            try:
+                if fmt == "revolut":
+                    m = self.mapper.map_revolut(row)
+                elif fmt == "bof_scot":
+                    m = self.mapper.map_bof_scot(row)
+                elif fmt == "alpha_gr":
+                    m = self.mapper.map_alpha_gr(row)
+                else:
+                    m = self.mapper.map_generic(row)
+
+                if skip_pending and str(m.get("state", "")).upper() == "PENDING":
+                    skipped_pending += 1
                     continue
-                try:
-                    if fmt == "revolut":
-                        m = self.mapper.map_revolut(row)
-                    elif fmt == "bof_scot":
-                        m = self.mapper.map_bof_scot(row)
-                    else:
-                        m = self.mapper.map_generic(row)
 
-                    if skip_pending and str(m.get("state", "")).upper() == "PENDING":
-                        skipped_pending += 1
-                        continue
-
-                    m["row_number"] = i
-                    m["import_hash"] = self._tx_hash(m)
-                    rows.append(m)
-                except Exception as e:
-                    print(f"Row {i}: mapping error - {e}")
+                m["row_number"] = i
+                m["import_hash"] = self._tx_hash(m)
+                rows.append(m)
+            except Exception as e:
+                print(f"Row {i}: mapping error - {e}")
         if skipped_pending:
             print(f"Skipped {skipped_pending} pending transaction(s) (not yet settled)")
         print(f"Read {len(rows)} transactions")
@@ -790,6 +1033,9 @@ class TransactionImporter:
         print("TRANSACTION PROCESSING")
         print("=" * 70)
         print(f"Source account: {self.source_account.fullname}")
+
+        if self.check_ledger and self._existing_ledger_index is None:
+            self._build_existing_ledger_index()
 
         for idx, tx in enumerate(transactions, 1):
             print(f"\n[{idx}/{len(transactions)}] Row {tx['row_number']}")
@@ -809,6 +1055,31 @@ class TransactionImporter:
                 else:
                     print("  Already imported - skipping")
                 continue
+
+            if self.check_ledger:
+                existing_match = self._find_existing_ledger_match(tx)
+                if existing_match is not None:
+                    print(
+                        f"\n  POSSIBLE DUPLICATE: an existing transaction on "
+                        f"{existing_match.post_date} for the same amount is "
+                        f"already in the ledger:"
+                    )
+                    print(f"    '{existing_match.description}'")
+                    if self.dry_run:
+                        print("  [DRY RUN] Would flag as possible duplicate - skipping")
+                        continue
+                    if self.auto_accept:
+                        print("  [AUTO-ACCEPT] Treating as duplicate - marking as skipped/imported")
+                        self._mark_skipped(tx, reason="matched existing ledger entry (auto-accept)")
+                        continue
+                    ans = input(
+                        "  Is this the same transaction? [Y]es (skip) / n (import anyway): "
+                    ).strip().lower()
+                    if ans in ["", "y", "yes"]:
+                        self._mark_skipped(tx, reason="matched existing ledger entry (user confirmed)")
+                        continue
+                    else:
+                        print("  Proceeding with import despite potential match")
 
             mm = self.payee_mapper.get_mapping(tx["payee"])
             if mm:
@@ -882,9 +1153,6 @@ class TransactionImporter:
             sel = self._manual_sel(tx, sugg)
             if sel:
                 self._prepare_tx(sel, tx)
-            # _manual_sel already handles the two skip variants internally
-            # (mark-as-imported vs. ask-again-next-time), printing its own
-            # status message, so no extra "Transaction skipped" print here.
 
     def _manual_sel(
         self, tx: dict, sugg: List[Tuple[object, float, str]]
@@ -1084,9 +1352,6 @@ class TransactionImporter:
         return "EXPENSE"
 
     def _prepare_tx(self, acct: object, tx: dict):
-        """Prepare a BALANCED double-entry transaction: one split against
-        the source (bank/Revolut) account, one offsetting split against
-        the chosen destination (expense/income) account."""
         commod = self._get_or_create_commodity(tx["currency"])
         amt = Decimal(str(tx["amount"]))
         self.tx_to_create.append(
@@ -1181,9 +1446,8 @@ def main():
     parser.add_argument(
         "--source-account",
         default=None,
-        help="Fullname of the GnuCash Asset account this CSV export belongs "
-        "to (e.g. 'Assets:Current Assets:Revolut GBP'). Prompted "
-        "interactively if omitted.",
+        help="Fullname of the GnuCash account this CSV export belongs to. "
+        "Prompted interactively if omitted.",
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="Show what would be done without saving"
@@ -1193,6 +1457,14 @@ def main():
         action="store_true",
         help="Auto-accept the top suggestion for every row without prompting "
         "(still writes to the book unless combined with --dry-run)",
+    )
+    parser.add_argument(
+        "--no-ledger-check",
+        action="store_true",
+        help="Skip cross-checking CSV rows against transactions already in "
+        "the book (only use the importer's own .imported_transactions.json "
+        "history). Use this if you know the CSV is entirely new data and "
+        "want to skip the extra indexing/prompting.",
     )
     parser.add_argument(
         "--list-mappings",
@@ -1253,6 +1525,7 @@ def main():
         imp = TransactionImporter(args.gnucash_file, args.csv_file)
         imp.dry_run = args.dry_run
         imp.auto_accept = args.auto_accept
+        imp.check_ledger = not args.no_ledger_check
         imp.payee_mapper = payee_mapper
 
         imp.open_book(readonly=args.dry_run)
