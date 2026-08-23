@@ -221,7 +221,7 @@ Bank of Scotland PDF statements are **not** directly importable. Use the bank's 
 Alpha Bank exports are detected automatically from their Greek header row and semicolon delimiter. They may include metadata before the actual transaction header:
 
 ```text
-Τίτλος;Κινήσεις Λογαριασμού: ;GR6901401190119002101336675;;;;;
+Τίτλος;Κινήσεις Λογαριασμού: ;IBAN;;;;
 Ημ/νία;22/08/2026 09:16;;;;;;
 ...
 Α/Α;Ημ/νία;Αιτιολογία;Κατάστημα;Τοκισμός από;Αρ. συναλλαγής;Ποσό;Πρόσημο ποσού
