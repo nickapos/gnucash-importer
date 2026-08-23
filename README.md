@@ -1,35 +1,33 @@
 # GnuCash CSV Importer
 
-A Python CLI importer for posting bank transactions from **Revolut**, **Bank of Scotland**, and **Alpha Bank Greece** CSV exports into a SQLite-backed GnuCash book.
+A Python CLI importer for **Revolut**, **Bank of Scotland**, and **Alpha Bank Greece** CSV exports into a SQLite-backed GnuCash book.
 
-The importer is designed for an existing GnuCash account tree. It reads the book, learns from prior transactions, suggests likely destination accounts, creates balanced double-entry transactions, tracks what it has processed, and checks the ledger for likely duplicates before importing.
+The importer reads your existing account tree, suggests destination accounts, creates balanced double-entry transactions, tracks imported or intentionally skipped rows, detects likely duplicate ledger entries, and creates timestamped database backups before making changes.
 
-> **Important:** This tool operates on a GnuCash SQLite book. Before using it against important financial data, make a backup and run a dry-run first.
+> **Important:** This tool modifies a GnuCash SQLite book. Test with `--dry-run` first and keep independent backups of important accounting data.
 
 ## Features
 
-- Supports CSV exports from:
+- Native CSV support for:
   - Revolut
   - Bank of Scotland
   - Alpha Bank Greece
-  - Generic CSV files containing date, payee, and amount fields
-- Reads your GnuCash account tree and uses it for interactive account selection.
-- Supports GBP, EUR, and USD transactions.
-- Creates properly balanced double-entry transactions.
-- Uses the CSV transaction date as GnuCash `post_date`.
-- Selects a source bank account for each import batch.
-- Learns persistent payee-to-account mappings in JSON.
-- Suggests destination accounts from:
-  - Previously saved mappings
-  - Existing GnuCash transaction history
-  - Exact and fuzzy account-name matches
-  - Keyword/token matches against account names
-- Detects likely duplicates already present in the GnuCash ledger, including transactions that were not imported by this script.
-- Lets you skip transactions either temporarily or permanently.
-- Excludes GnuCash internal `Orphan-*` and scheduled-transaction template accounts from source-account selection.
-- Supports account-path tab completion for manual account selection in compatible terminals.
-- Exports account metadata to JSON.
-- Includes support for validating imported records against their original CSV.
+  - Generic CSV files with date, payee, and amount fields
+- Balanced double-entry transactions between a selected source bank account and a destination account.
+- Correct `post_date` from the source CSV.
+- GBP, EUR, and USD support.
+- Account suggestions based on mappings, transaction history, account names, and keywords.
+- Persistent payee-to-account mappings.
+- Manual account-path entry with terminal tab completion.
+- Source-account search across GnuCash asset-like account types.
+- Automatic exclusion of internal GnuCash template and `Orphan-*` accounts.
+- Duplicate checks against:
+  - Rows previously handled by this importer.
+  - Transactions already present in the selected GnuCash source account.
+- Skip a row temporarily or permanently mark it as handled.
+- Timestamped SQLite database backup before the first write in each run.
+- Configurable backup retention.
+- Account-tree export and imported-record date validation.
 
 ## Requirements
 
@@ -38,7 +36,7 @@ The importer is designed for an existing GnuCash account tree. It reads the book
 - `piecash`
 - SQLAlchemy compatible with your installed piecash version
 
-Install Python dependencies in a virtual environment:
+Example setup:
 
 ```bash
 python3 -m venv .venv
@@ -46,44 +44,24 @@ source .venv/bin/activate
 pip install piecash "SQLAlchemy<2"
 ```
 
-Depending on the version of piecash you use, you may need a different SQLAlchemy version. The importer suppresses known piecash/SQLAlchemy relationship warnings, but should still be tested with your installed environment.
+Exact SQLAlchemy requirements can vary with the piecash release you use. Test against a copy of your book first.
 
-## GnuCash File Format
+## GnuCash Format
 
-`piecash` works with SQL-backed GnuCash books, not normal XML GnuCash books. The importer expects a SQLite `.gnucash` file.
+`piecash` works with SQL-backed GnuCash books, not ordinary XML books. The importer expects a SQLite `.gnucash` file.
 
 To convert an XML book:
 
 1. Open the XML book in GnuCash.
-2. Choose **File → Save As…**.
+2. Select **File → Save As…**.
 3. Select the **sqlite3** format.
-4. Save a new copy, for example:
+4. Save a new copy, for example `portfolio-sqlite.gnucash`.
 
-```text
-portfolio-sqlite.gnucash
-```
-
-Keep your original XML file as a backup.
-
-## Safety First
-
-Before every real import:
-
-1. Close GnuCash and any other process using the SQLite book.
-2. Make a copy of the `.gnucash` file.
-3. Run the importer with `--dry-run` first.
-4. Verify source account, dates, amounts, suggestions, and duplicate prompts.
-5. Only then run without `--dry-run`.
-
-A practical backup command on macOS/Linux is:
-
-```bash
-cp portfolio-sqlite.gnucash portfolio-sqlite.gnucash.backup-$(date +%Y%m%d-%H%M%S)
-```
+Keep the original XML file as an independent backup.
 
 ## Quick Start
 
-Run an interactive dry-run against a Revolut CSV:
+Run a review-only import first:
 
 ```bash
 python ./gnucash_importer.py \
@@ -92,7 +70,7 @@ python ./gnucash_importer.py \
   --dry-run
 ```
 
-For a real import, omit `--dry-run`:
+For a real interactive import, omit `--dry-run`:
 
 ```bash
 python ./gnucash_importer.py \
@@ -100,39 +78,103 @@ python ./gnucash_importer.py \
   --csv-file="transactions.csv"
 ```
 
-The importer asks which GnuCash account the CSV belongs to. This is the **source account**: the bank account from which money left or arrived.
+The importer asks which GnuCash account the file belongs to. This is the **source account**: the bank account whose statement you exported.
 
-For example, a Revolut GBP import might use:
+For example:
 
 ```text
 Assets:Current Assets:Revolut GBP
-```
-
-An Alpha Bank Greece EUR import might use:
-
-```text
+Assets:Current Assets:BOS Salary Account
 Assets:Current Assets:Alpha Bank Savings
 ```
 
-After selecting or confirming destination accounts, the script prepares transactions. It asks for final confirmation before saving them to the GnuCash book.
+## Database Backups
+
+### Automatic Backups
+
+On every non-dry-run execution that is about to change the GnuCash book, the importer creates exactly one backup **before the first write**.
+
+This includes writes caused by either:
+
+- Creating a new account.
+- Committing prepared transactions.
+
+No backup is created during `--dry-run`, because dry-run never writes to the database.
+
+Backups are placed in a `backups/` directory next to the SQLite GnuCash book:
+
+```text
+finance/
+├── portfolio-sqlite.gnucash
+└── backups/
+    ├── portfolio-sqlite.backup-20260823-032501.gnucash
+    ├── portfolio-sqlite.backup-20260823-041902.gnucash
+    └── portfolio-sqlite.backup-20260824-090317.gnucash
+```
+
+The filename timestamp uses local time in this format:
+
+```text
+YYYYMMDD-HHMMSS
+```
+
+### Backup Retention
+
+By default, the importer keeps the **10 newest** backups and deletes older importer-created backups after a new backup is created.
+
+Set a different count with `--keep-backups`:
+
+```bash
+python ./gnucash_importer.py \
+  --gnucash-file="portfolio-sqlite.gnucash" \
+  --csv-file="transactions.csv" \
+  --keep-backups=30
+```
+
+Set `0` to disable automatic pruning and keep all backups:
+
+```bash
+python ./gnucash_importer.py \
+  --gnucash-file="portfolio-sqlite.gnucash" \
+  --csv-file="transactions.csv" \
+  --keep-backups=0
+```
+
+> Backup pruning only affects files created by this importer in the `backups/` directory whose names match the expected backup pattern. It does not delete arbitrary files.
+
+### Restoring a Backup
+
+Close GnuCash and all importer processes first. Then replace the live database with a chosen backup:
+
+```bash
+cp backups/portfolio-sqlite.backup-20260823-032501.gnucash portfolio-sqlite.gnucash
+```
+
+Make a copy of the current file before restoring if you may need to return to it:
+
+```bash
+cp portfolio-sqlite.gnucash portfolio-sqlite.gnucash.before-restore
+```
+
+Automatic backups are a convenience feature, not a complete disaster-recovery strategy. Keep independent backups using Time Machine, cloud backup, versioned storage, or your preferred backup system.
 
 ## Source Account Selection
 
-Every imported transaction needs two sides:
+Every import transaction has two sides:
 
-1. The source bank account represented by the CSV.
-2. The destination account selected for the payee, such as an expense, income, or transfer category.
+1. The source account represented by the statement.
+2. The destination expense, income, transfer, or other category account.
 
-For a card payment of £35.08 from Revolut to Toby Carvery, the resulting transaction is conceptually:
+For example, a Revolut card payment of £35.08 may create:
 
 ```text
-Assets:Current Assets:Revolut GBP       -35.08 GBP
-Expenses:Entertainment:Recreation:...   +35.08 GBP
+Assets:Current Assets:Revolut GBP      -35.08 GBP
+Expenses:Food:Restaurant                 35.08 GBP
 ```
 
-The two split values sum to zero, satisfying GnuCash double-entry rules.
+The values sum to zero, satisfying GnuCash double-entry rules.
 
-You can avoid the interactive source-account prompt with `--source-account`:
+Specify the source account directly to avoid the interactive picker:
 
 ```bash
 python ./gnucash_importer.py \
@@ -142,251 +184,188 @@ python ./gnucash_importer.py \
   --dry-run
 ```
 
-The selector includes GnuCash asset-like account types such as `ASSET`, `BANK`, `CASH`, `CHECKING`, `STOCK`, `MUTUAL`, and `RECEIVABLE`. It excludes internal GnuCash accounts such as:
+The picker considers GnuCash account types:
 
-- `Orphan-GBP`, `Orphan-EUR`, etc.
-- Scheduled transaction template accounts, often shown with random GUID-like names and a `template` commodity
+```text
+ASSET, BANK, CASH, CHECKING, STOCK, MUTUAL, RECEIVABLE
+```
 
-If the account you need is not visible, type a partial search term at the prompt:
+This matters because accounts made with the GnuCash UI may be typed as `BANK`, while older scripts might only look for generic `ASSET` accounts.
+
+Internal accounts are excluded:
+
+- `Orphan-GBP`, `Orphan-EUR`, etc. — unresolved/suspense import artifacts.
+- GUID-like template accounts used internally for scheduled transactions.
+
+If you do not see an account, type a partial search term:
 
 ```text
 Enter number, exact account path (Tab to autocomplete), or search term: alpha
 ```
 
-The script searches all eligible asset-like accounts and presents matching entries.
-
-## Supported CSV Formats
+## Supported Formats
 
 ### Revolut
 
-The importer recognizes the modern Revolut export format:
+Supported modern format:
 
 ```text
 Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
 ```
 
-Example:
-
-```text
-Card Payment,Current,2026-08-15 11:18:10,2026-08-16 11:16:55,Charing Cross Car Park,-3.50,0.00,GBP,COMPLETED,348.86
-```
-
-Mapping:
-
-| Revolut column | Imported field |
+| Column | Imported as |
 |---|---|
 | `Completed Date` | Transaction date; falls back to `Started Date` |
-| `Description` | Payee / GnuCash description |
-| `Amount` | Signed transaction amount |
-| `Currency` | Currency code |
+| `Description` | Payee |
+| `Amount` | Signed amount |
+| `Currency` | Currency |
 | `Type` + `State` | Memo |
 
-Pending Revolut transactions are excluded by default. To include them:
+Pending transactions are skipped by default. Include them with:
 
 ```bash
-python ./gnucash_importer.py \
-  --gnucash-file="portfolio-sqlite.gnucash" \
-  --csv-file="transactions.csv" \
-  --include-pending
+--include-pending
 ```
 
 ### Bank of Scotland
 
-The importer supports Bank of Scotland CSV exports with columns similar to:
+Supported CSV columns:
 
 ```text
 Date,Description,Type,Money In (£),Money Out (£),Balance (£)
 ```
 
-Example logical row:
-
-```text
-03 Aug 26,DVLA-SB61XDW,DD,,35.93,1849.75
-```
-
-Mapping:
-
-| Bank of Scotland column | Imported field |
+| Column | Imported as |
 |---|---|
 | `Date` | Transaction date, parsed as `DD Mon YY` |
 | `Description` | Payee |
 | `Money In (£)` | Positive amount |
 | `Money Out (£)` | Negative amount |
-| `Type` | Human-readable memo, e.g. `DD` → `Direct Debit` |
+| `Type` | Expanded memo, such as `DD` → `Direct Debit` |
 
-Bank of Scotland PDF statements are **not** directly importable. Use the bank's online-banking transaction download/export function to obtain CSV data first.
+Bank of Scotland PDF statements are not importable directly. Download a CSV from online banking first.
 
 ### Alpha Bank Greece
 
-Alpha Bank exports are detected automatically from their Greek header row and semicolon delimiter. They may include metadata before the actual transaction header:
+Alpha Bank exports are detected automatically from their Greek header row and semicolon delimiter. The file may have metadata before the actual header:
 
 ```text
-Τίτλος;Κινήσεις Λογαριασμού: ;IBAN;;;;
-Ημ/νία;22/08/2026 09:16;;;;;;
+Τίτλος;Κινήσεις Λογαριασμού: ;GR6901401190119002101336675;;;;;
 ...
 Α/Α;Ημ/νία;Αιτιολογία;Κατάστημα;Τοκισμός από;Αρ. συναλλαγής;Ποσό;Πρόσημο ποσού
 ```
 
-The importer skips the metadata preamble and starts at the real header.
-
-| Greek column | Meaning | Imported field |
+| Greek column | Meaning | Imported as |
 |---|---|---|
-| `Ημ/νία` | Date | Transaction date, `DD/MM/YYYY` |
-| `Αιτιολογία` | Reason/description | Payee |
+| `Ημ/νία` | Date | Transaction date (`DD/MM/YYYY`) |
+| `Αιτιολογία` | Description | Payee |
 | `Αρ. συναλλαγής` | Transaction reference | Memo |
-| `Ποσό` | Amount | Amount parsed using European decimal format |
-| `Πρόσημο ποσού` | Amount sign | `Χ` = debit/negative; `Π` = credit/positive |
+| `Ποσό` | Amount | Amount parsed with European formatting |
+| `Πρόσημο ποσού` | Amount sign | `Χ` debit = negative; `Π` credit = positive |
 
 Examples:
 
 ```text
-135,10;Χ        -> -135.10 EUR
-1.100,00;Π      -> +1100.00 EUR
-1.532,76;Χ      -> -1532.76 EUR
+135,10;Χ    -> -135.10 EUR
+1.100,00;Π  -> +1100.00 EUR
+1.532,76;Χ  -> -1532.76 EUR
 ```
 
-Alpha Bank exports are treated as EUR transactions by default.
+The Alpha Bank mapper defaults currency to EUR.
 
 ## Account Matching
 
-The importer proposes destination accounts using several layers, in priority order:
+The importer suggests destination accounts through these layers:
 
-1. Existing manually saved payee mappings.
-2. Transaction history from the GnuCash book.
+1. Persistent saved payee mappings.
+2. Existing GnuCash transaction history.
 3. Exact and substring account-name matches.
-4. Token/keyword overlap against account names.
+4. Keyword/token overlap against account names.
 
-For example, a payee such as:
+Example: `Charing Cross Car Park` may suggest parking accounts that share terms such as `car` and `park`, even if the exact payee was never seen before.
 
-```text
-Charing Cross Car Park
-```
+Generic history words such as `transfer` are down-weighted so distinctive words, such as a surname, are more useful matches.
 
-can suggest accounts such as:
+### Persistent Mappings
 
-```text
-Expenses:Auto:Parking:Quay car park
-Expenses:Auto:Parking:Odyssey car park
-```
-
-because they share meaningful keywords such as `car` and `park`.
-
-The importer also down-weights generic history words such as `transfer` and `payment`, making rarer terms such as a surname more useful for matching.
-
-### Persistent Payee Mappings
-
-When you select an account and agree to save it, the mapping is written to:
+Saved mappings are written to:
 
 ```text
 .payee_account_mappings.json
 ```
 
-On future imports, the same payee goes directly to that account if the currency matches.
-
-List mappings:
+List them:
 
 ```bash
 python ./gnucash_importer.py --list-mappings
 ```
 
-Clear mappings:
+Clear them:
 
 ```bash
 python ./gnucash_importer.py --clear-mappings
 ```
 
-## Create a New Account
+## Creating and Entering Accounts
 
-If no exact destination account exists, the importer can create one. It suggests a path based on the strongest existing category match.
-
-For example, if the best account suggestions are below:
-
-```text
-Expenses:Auto:Parking:Quay car park
-Expenses:Auto:Parking:Odyssey car park
-```
-
-then creating a new account for `Charing Cross Car Park` suggests:
+When suggestions point to a category, creating an account uses that category as a starting point. For example, parking suggestions under `Expenses:Auto:Parking:*` can produce:
 
 ```text
 Expenses:Auto:Charing Cross Car Park
 ```
 
-New accounts are saved to the GnuCash book immediately rather than waiting until transaction import is confirmed. This avoids a stale payee mapping pointing at an account that only existed in memory.
+New accounts are saved immediately before their related mapping is persisted.
 
-## Manual Account Entry
+Use manual account path entry to select an existing account or create a new one. Compatible terminals support tab completion.
 
-The account-selection menu contains:
+## Skipping Rows
 
-```text
-Enter account path manually (tab to autocomplete)
-```
-
-In compatible terminal environments, type the beginning of an account path and press **Tab** to complete it. Press Tab twice to show alternatives.
-
-Examples:
-
-```text
-Assets:Current Assets:Re<Tab>
-Expenses:Misc<Tab>
-```
-
-If you enter an existing full account path, it is selected. If you enter a new valid path, the importer creates the missing account path components.
-
-## Skipping Transactions
-
-The interactive account-selection menu has two different skip options:
+The interactive selection menu has two skip choices:
 
 ```text
 Skip and mark as imported (never ask again)
 Skip for now (ask again next run)
 ```
 
-### Skip and Mark as Imported
+### Permanent Skip
 
-This does **not** create a GnuCash transaction. It writes a record to:
+A permanent skip creates no GnuCash transaction. It writes a record containing `"skipped": true` to:
 
 ```text
 .imported_transactions.json
 ```
 
-with `"skipped": true`, using the transaction's content hash. On future imports, the importer reports:
+The source row will then report as already handled on future imports.
 
-```text
-Already marked as skipped/imported - skipping
-```
+### Temporary Skip
 
-This is useful for items you intentionally do not want in GnuCash, such as transfers handled elsewhere, non-financial entries, duplicates, or known irrelevant transactions.
-
-### Skip for Now
-
-This skips only the current run. Nothing is recorded, so the row returns next time.
+A temporary skip writes nothing. The row is offered again next time.
 
 ## Duplicate Detection
 
-The importer uses **two independent duplicate checks**.
+The importer uses two duplicate layers.
 
-### 1. Importer History
+### Importer History
 
-The transaction hash is based on:
+It hashes each row using:
 
 ```text
 CSV date | payee | amount
 ```
 
-Any transaction already recorded in `.imported_transactions.json` is skipped automatically. This catches rows imported or deliberately skipped by the script before.
+If that hash already exists in `.imported_transactions.json`, the row is skipped.
 
-### 2. Existing GnuCash Ledger Check
+### Existing Ledger Check
 
-Before processing rows, the importer builds an index of existing transactions already in the GnuCash book, restricted to the selected source account. It uses the key:
+The importer also indexes transactions already in the selected source account using:
 
 ```text
 (post_date, signed source-account split amount)
 ```
 
-This catches transactions that exist in GnuCash but were not created by this importer, such as manually entered records or records imported through GnuCash's own bank-import workflow.
+This finds transactions entered manually or imported outside this script.
 
-When a match is found, the importer asks:
+When a candidate is found:
 
 ```text
 POSSIBLE DUPLICATE: an existing transaction on 2026-08-19 for the same amount is already in the ledger:
@@ -394,21 +373,9 @@ POSSIBLE DUPLICATE: an existing transaction on 2026-08-19 for the same amount is
 Is this the same transaction? [Y]es (skip) / n (import anyway):
 ```
 
-- Enter or `Y`: mark the CSV row skipped/imported so it does not return.
-- `n`: import it anyway.
+Use `--no-ledger-check` to disable this extra check when you know the file contains entirely new data.
 
-Disable the ledger check when you know the file is entirely new data:
-
-```bash
-python ./gnucash_importer.py \
-  --gnucash-file="portfolio-sqlite.gnucash" \
-  --csv-file="transactions.csv" \
-  --no-ledger-check
-```
-
-## Dry-Run Mode
-
-Dry-run mode opens the GnuCash book read-only and never writes transactions, accounts, mappings, or skipped-record history:
+## Dry Run
 
 ```bash
 python ./gnucash_importer.py \
@@ -417,19 +384,15 @@ python ./gnucash_importer.py \
   --dry-run
 ```
 
-Dry-run mode still:
+Dry-run opens the book read-only and does not:
 
-- Detects the bank format.
-- Loads and analyzes the account tree.
-- Selects the source account.
-- Checks the existing ledger for likely duplicates.
-- Displays suggestions and planned actions.
+- Create backups.
+- Create accounts.
+- Save mappings.
+- Mark skipped rows as imported.
+- Write transactions.
 
-It does **not** open the manual account-selection menu, create accounts, save mappings, or mark skipped rows as imported.
-
-## Auto-Accept Mode
-
-`--auto-accept` takes the top suggestion automatically and performs the import without per-row prompts:
+## Auto-Accept
 
 ```bash
 python ./gnucash_importer.py \
@@ -439,11 +402,11 @@ python ./gnucash_importer.py \
   --auto-accept
 ```
 
-Be cautious: automatic acceptance is suitable only after you have tested the matching quality using dry-runs and saved reliable payee mappings. If no account suggestion exists, the importer marks the row skipped/imported rather than guessing.
+This chooses the top account suggestion automatically. Use only after validating matching quality with dry-runs.
 
-## Record Validation
+## Validation
 
-Use the companion `validate_import.py` tool to compare previously imported transactions with the source CSV and identify post-date mismatches:
+Use `validate_import.py` to compare imported records against their original CSV, particularly for date validation:
 
 ```bash
 python validate_import.py \
@@ -451,7 +414,7 @@ python validate_import.py \
   --csv-file="transactions.csv"
 ```
 
-To correct detected date mismatches:
+Fix identified post-date mismatches:
 
 ```bash
 python validate_import.py \
@@ -460,11 +423,9 @@ python validate_import.py \
   --fix
 ```
 
-Transactions imported before transaction GUID tracking was added may be reported as legacy imports that cannot be automatically verified. Rows deliberately skipped-and-marked-as-imported are reported separately and not treated as errors.
+## Account Export
 
-## Export Accounts to JSON
-
-Export the full account tree to JSON:
+Export account metadata to JSON:
 
 ```bash
 python ./gnucash_importer.py \
@@ -472,29 +433,66 @@ python ./gnucash_importer.py \
   --export-accounts
 ```
 
-The generated `accounts.json` includes each account's GUID, name, fullname, type, description, currency, and parent GUID.
+## SQLite Lock Recovery
 
-## Stale SQLite Locks
-
-GnuCash SQLite books use an internal `gnclock` table. If GnuCash, piecash, or the importer crashes before closing the book, a stale lock may remain.
-
-The importer uses `try/finally` to call `book.close()` on normal completion, errors, and Ctrl+C interruptions. It prints:
+GnuCash SQLite uses an internal `gnclock` table. The importer closes the book in a `finally` block and prints:
 
 ```text
 GnuCash book closed - lock released.
 ```
 
-If a stale lock remains from an earlier crash, close GnuCash and every importer process first, then run the companion cleanup tool:
+If a stale lock remains after a historical crash, close GnuCash and all importer processes, then run:
 
 ```bash
 python clear_gnclock.py portfolio-sqlite.gnucash
 ```
 
-Only do this when no process genuinely has the file open. Clearing an active lock while another writer is using the database risks corruption.
+Only clear a lock when no other process is genuinely using the book.
+
+## Persistent Files
+
+| File | Purpose |
+|---|---|
+| `.imported_transactions.json` | Records imported and permanently skipped rows |
+| `.payee_account_mappings.json` | Stores payee-to-account mappings |
+| `.transaction_history_analysis.json` | Cached transaction history analysis |
+| `accounts.json` | Optional account-tree export |
+| `backups/` | Timestamped SQLite database backups |
+
+Keep these files in the same project directory as the importer if you want matching and duplicate history to persist consistently.
+
+## Troubleshooting
+
+### `Invalid argument(s) 'backend' sent to create_engine()`
+
+Remove obsolete `backend="xml"` or `check_exists=False` parameters from `piecash.open_book()`. The script expects a SQLite book.
+
+### `GncImbalanceError`
+
+The transaction has unbalanced splits. The importer creates a source-account split and an equal-and-opposite destination split, so this should not occur unless the script has been modified or a source account is invalid.
+
+### An account is missing from the source list
+
+Search by a partial name at the prompt, for example:
+
+```text
+alpha
+revolut
+bos
+```
+
+The importer includes `BANK` accounts as well as generic `ASSET` accounts, so GnuCash savings/checking accounts should appear.
+
+### `Orphan-*` or GUID/template accounts appear
+
+Use the current version of the importer. The source-account selector excludes:
+
+- `Orphan-<currency>` unresolved-split accounts.
+- Scheduled-transaction template accounts.
 
 ## Typical Commands
 
-### Revolut import, review first
+### Revolut review
 
 ```bash
 python ./gnucash_importer.py \
@@ -522,66 +520,3 @@ python ./gnucash_importer.py \
   --source-account="Assets:Current Assets:Alpha Bank Savings" \
   --dry-run
 ```
-
-After reviewing output, run the same command without `--dry-run` to perform the import.
-
-## Persistent Files
-
-The script keeps small JSON state files in its current working directory:
-
-| File | Purpose |
-|---|---|
-| `.imported_transactions.json` | Tracks imported and permanently skipped rows using a content hash |
-| `.payee_account_mappings.json` | Stores payee → GnuCash account mappings |
-| `.transaction_history_analysis.json` | Cached analysis of existing transaction history |
-| `accounts.json` | Optional exported account tree |
-
-Keep these files in the same project directory as the importer if you want mappings and duplicate history to persist consistently.
-
-## Troubleshooting
-
-### `Invalid argument(s) 'backend' sent to create_engine()`
-
-Remove obsolete `backend="xml"` or `check_exists=False` arguments from `piecash.open_book()`. The current script opens SQLite books directly and does not use an XML backend option.
-
-### `CSV not found`
-
-Pass the real CSV path explicitly:
-
-```bash
-python ./gnucash_importer.py \
-  --gnucash-file="portfolio-sqlite.gnucash" \
-  --csv-file="/full/path/to/statement.csv"
-```
-
-### `GncImbalanceError`
-
-This means a transaction did not have balanced splits. The current script creates one source-account split and one equal-and-opposite destination-account split, so this should not occur unless the script has been modified or the source account is invalid.
-
-### Account not listed
-
-At the source-account prompt, type a partial name, for example:
-
-```text
-alpha
-revolut
-tsb
-bos
-```
-
-The script searches all asset-like account types, including GnuCash `BANK` accounts, not only generic `ASSET` accounts.
-
-### `Orphan-GBP` or GUID/template entries appear
-
-Use the latest version of the script. It excludes:
-
-- `Orphan-<currency>` accounts, which are GnuCash unresolved-split/suspense artifacts.
-- Template accounts used internally by scheduled transactions, typically named with a GUID-like hex string and commodity `template`.
-
-## Limitations
-
-- The duplicate ledger check deliberately uses exact **date + amount** on the selected source account, because this is reliable and avoids broad false positives. It may still flag legitimate same-day transactions with the same amount; the interactive prompt lets you import anyway.
-- Matching suggestions are advisory. Review new or low-confidence mappings before accepting them.
-- Do not use the same SQLite GnuCash book simultaneously in GnuCash desktop and the importer.
-- Make backups before any non-dry-run import.
-- The script does not parse PDF statements directly; obtain CSV exports from banks where necessary.
