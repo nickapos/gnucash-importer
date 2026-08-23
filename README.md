@@ -1,87 +1,53 @@
-# GnuCash CSV Importer
+# GnuCash CSV Importer and Reporting Toolkit
 
-A Python toolkit for importing bank transactions into a SQLite-backed GnuCash book and reporting on income, expenses, and cash flow.
+A Python toolkit for importing bank transaction CSV files into a SQLite-backed GnuCash book and producing income, expense, and cash-flow reports.
 
-It includes two primary scripts:
+## Included Scripts
 
-- `gnucash_importer.py` — imports CSV bank transactions from Revolut, Bank of Scotland, Alpha Bank Greece, or a generic CSV format.
-- `income_expense_report.py` — generates read-only monthly income/expense/cash-flow reports for a selected year.
+| Script | Purpose |
+|---|---|
+| `gnucash_importer.py` | Imports bank CSV transactions into GnuCash with account suggestions, duplicate checks, backups, and mappings. |
+| `income_expense_report.py` | Creates read-only monthly income, expense, and cash-flow reports. Supports native currencies and consolidated reporting using GnuCash’s Price Database. |
+| `validate_import.py` | Validates recorded imports against source CSV data and can repair transaction-date mismatches. |
+| `clear_gnclock.py` | Clears stale SQLite GnuCash lock rows after confirming no genuine writer is active. |
 
-Additional helper scripts may be present:
-
-- `validate_import.py` — validates imported transactions against a source CSV and can correct post-date mismatches.
-- `clear_gnclock.py` — removes stale SQLite GnuCash locks after confirming no real writer is active.
-
-> **Important:** The importer modifies a GnuCash SQLite book. Always use `--dry-run` first and retain independent backups of important accounting data.
-
-## Features
-
-### Importer
-
-- Native CSV support for:
-  - Revolut
-  - Bank of Scotland
-  - Alpha Bank Greece
-  - Generic date/payee/amount CSV files
-- Balanced double-entry transactions between the statement source account and selected destination account.
-- CSV transaction date used as GnuCash `post_date`.
-- Supports GBP, EUR, and USD accounts.
-- Account suggestions from mappings, history, account names, and keyword overlap.
-- Persistent payee-to-account mappings.
-- Manual account path entry with tab completion in compatible terminals.
-- Duplicate detection against both importer history and existing GnuCash transactions.
-- Permanent and temporary skip modes.
-- Timestamped pre-write SQLite database backups with configurable retention.
-- Excludes internal GnuCash template accounts and `Orphan-*` accounts from source-account selection.
-
-### Reporting
-
-- Read-only monthly income, expense, and net cash-flow report.
-- Runtime year selection with `--year`.
-- Separate reports per currency by default, avoiding invalid GBP/EUR/USD totals.
-- Optional one-currency reporting with `--currency`.
-- Optional annual breakdown by income/expense account.
-- Optional CSV export.
-- Optional PNG cash-flow chart.
-- Direct SQLite read-only access: no piecash dependency and no GnuCash lock is created.
+> **Important:** `gnucash_importer.py` modifies the book. Always use `--dry-run` first and keep independent backups. `income_expense_report.py` is read-only.
 
 ## Requirements
 
-- Python 3.9 or newer.
-- A GnuCash book stored using the **SQLite** backend.
+- Python 3.9 or newer
+- A GnuCash book stored using the **SQLite** backend
 - Importer dependencies:
   - `piecash`
-  - SQLAlchemy compatible with the installed piecash version
-- Optional reporting-chart dependency:
+  - A compatible SQLAlchemy version
+- Optional chart dependency:
   - `matplotlib`
 
-Example environment setup:
+Example setup:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install piecash "SQLAlchemy<2"
-pip install matplotlib  # only needed for --plot
+pip install matplotlib  # required only for --plot
 ```
 
-The reporting script itself uses only Python’s standard library unless you request a plot.
+## GnuCash Database Format
 
-## GnuCash Format
+The importer requires a GnuCash SQLite book. If your primary book is XML:
 
-`piecash` works with SQL-backed GnuCash books, not ordinary XML books. The importer therefore expects a SQLite `.gnucash` file.
+1. Open it in GnuCash.
+2. Choose **File → Save As…**.
+3. Select **sqlite3**.
+4. Save a new copy such as `portfolio-sqlite.gnucash`.
 
-To convert an XML book:
+Keep the XML original as an independent backup.
 
-1. Open the XML book in GnuCash.
-2. Select **File → Save As…**.
-3. Choose the **sqlite3** format.
-4. Save a new copy, for example `portfolio-sqlite.gnucash`.
+# Importer
 
-Keep the original XML file as an independent backup.
+## Basic Workflow
 
-## Import Quick Start
-
-Review a file without writing anything:
+Review without writing:
 
 ```bash
 python ./gnucash_importer.py \
@@ -98,7 +64,7 @@ python ./gnucash_importer.py \
   --csv-file="transactions.csv"
 ```
 
-The importer asks which GnuCash account is represented by the statement. This is the **source account** — for example:
+The script asks for the **source account** represented by the statement, for example:
 
 ```text
 Assets:Current Assets:Revolut GBP
@@ -106,49 +72,35 @@ Assets:Current Assets:BOS Salary Account
 Assets:Current Assets:Alpha Bank Savings
 ```
 
-Specify it explicitly to avoid the prompt:
+Avoid the prompt with:
 
 ```bash
-python ./gnucash_importer.py \
-  --gnucash-file="portfolio-sqlite.gnucash" \
-  --csv-file="transactions.csv" \
-  --source-account="Assets:Current Assets:Revolut GBP" \
-  --dry-run
+--source-account="Assets:Current Assets:Revolut GBP"
+```
+
+Every imported transaction is a balanced double-entry transaction:
+
+```text
+Assets:Current Assets:Revolut GBP      -35.08 GBP
+Expenses:Food:Restaurant                 35.08 GBP
 ```
 
 ## Database Backups
 
-### Automatic Pre-Write Backup
+Before the first write in a non-dry-run import, the importer makes one timestamped SQLite backup.
 
-On every non-dry-run session that is about to change the book, the importer creates exactly one timestamped backup **before the first write**.
-
-A backup is made before either:
-
-- Creating a new GnuCash account.
-- Saving imported transactions.
-
-No backup is created during `--dry-run` because dry-run never writes.
-
-Backups are stored beside the GnuCash database:
+Backups are stored next to the database:
 
 ```text
-finance/
-├── portfolio-sqlite.gnucash
-└── backups/
-    ├── portfolio-sqlite.backup-20260823-032501.gnucash
-    ├── portfolio-sqlite.backup-20260823-041902.gnucash
-    └── portfolio-sqlite.backup-20260824-090317.gnucash
+backups/
+├── portfolio-sqlite.backup-20260823-032501.gnucash
+├── portfolio-sqlite.backup-20260823-041902.gnucash
+└── portfolio-sqlite.backup-20260824-090317.gnucash
 ```
 
-The timestamp format is:
+One backup is made per write run, even when the run both creates accounts and imports transactions.
 
-```text
-YYYYMMDD-HHMMSS
-```
-
-### Backup Retention
-
-The default is to keep the newest **10** importer-created backups.
+Default retention is 10 backups:
 
 ```bash
 python ./gnucash_importer.py \
@@ -157,87 +109,37 @@ python ./gnucash_importer.py \
   --keep-backups=30
 ```
 
-Use `0` to retain every backup permanently:
+Retain every backup permanently:
 
 ```bash
-python ./gnucash_importer.py \
-  --gnucash-file="portfolio-sqlite.gnucash" \
-  --csv-file="transactions.csv" \
-  --keep-backups=0
+--keep-backups=0
 ```
 
-Pruning affects only importer-created files matching the expected timestamped backup naming pattern inside `backups/`.
+No backup is made during `--dry-run` because no database write occurs.
 
-### Restore a Backup
-
-Close GnuCash and the importer first. Then replace the live database with a chosen backup:
+To restore a backup, close GnuCash and all import processes first:
 
 ```bash
 cp backups/portfolio-sqlite.backup-20260823-032501.gnucash portfolio-sqlite.gnucash
-```
-
-Before restoring, preserve the current version if required:
-
-```bash
-cp portfolio-sqlite.gnucash portfolio-sqlite.gnucash.before-restore
-```
-
-Automatic backups are a convenience feature, not a complete disaster-recovery plan. Use Time Machine, cloud backup, versioned storage, or another independent backup mechanism as well.
-
-## Source Account Selection
-
-Every imported transaction has two sides:
-
-1. The source account represented by the bank statement.
-2. A destination account such as an income, expense, transfer, or category account.
-
-For example, a Revolut card payment might create:
-
-```text
-Assets:Current Assets:Revolut GBP      -35.08 GBP
-Expenses:Food:Restaurant                 35.08 GBP
-```
-
-The splits sum to zero, satisfying GnuCash double-entry rules.
-
-The importer includes all GnuCash asset-like account types:
-
-```text
-ASSET, BANK, CASH, CHECKING, STOCK, MUTUAL, RECEIVABLE
-```
-
-This is important because GnuCash commonly gives savings/checking accounts the `BANK` type, not the generic `ASSET` type.
-
-The selector excludes internal accounts such as:
-
-- `Orphan-GBP`, `Orphan-EUR`, etc. — unresolved split/suspense accounts.
-- GUID-like template accounts used internally for scheduled transactions.
-
-If an account is not listed, type a partial search term at the prompt:
-
-```text
-Enter number, exact account path (Tab to autocomplete), or search term: alpha
 ```
 
 ## Supported Bank Formats
 
 ### Revolut
 
-Supported modern columns:
+Supported modern header:
 
 ```text
 Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
 ```
 
-| CSV field | Imported field |
-|---|---|
-| `Completed Date` | Transaction date; falls back to `Started Date` |
-| `Description` | Payee |
-| `Amount` | Signed amount |
-| `Currency` | Currency |
-| `Type` + `State` | Memo |
+- `Completed Date` is the transaction date, falling back to `Started Date`.
+- `Description` becomes payee.
+- `Amount` is signed directly.
+- `Currency` selects the transaction currency.
+- `Type` and `State` form the memo.
 
-Pending transactions are skipped by default. Include them using:
+Pending rows are excluded by default. Include them with:
 
 ```bash
 --include-pending
@@ -245,25 +147,22 @@ Pending transactions are skipped by default. Include them using:
 
 ### Bank of Scotland
 
-Supported CSV columns:
+Supported columns:
 
 ```text
 Date,Description,Type,Money In (£),Money Out (£),Balance (£)
 ```
 
-| CSV field | Imported field |
-|---|---|
-| `Date` | Date, parsed as `DD Mon YY` |
-| `Description` | Payee |
-| `Money In (£)` | Positive amount |
-| `Money Out (£)` | Negative amount |
-| `Type` | Human-readable memo, for example `DD` → `Direct Debit` |
+- `Money In (£)` is positive.
+- `Money Out (£)` is negative.
+- Dates parse as `DD Mon YY`, such as `03 Aug 26`.
+- The transaction type is expanded into the memo, for example `DD` becomes `Direct Debit`.
 
-Bank of Scotland PDF statements are not imported directly. Download a CSV from online banking first.
+Download CSV data from online banking. PDF statements are not imported directly.
 
 ### Alpha Bank Greece
 
-Alpha Bank exports are detected from their Greek header row and semicolon delimiter. The file includes metadata before the real header:
+Alpha Bank exports use semicolon delimiters, Greek headers, European number formatting, and a metadata preamble before the actual header:
 
 ```text
 Τίτλος;Κινήσεις Λογαριασμού: ;GR6901401190119002101336675;;;;;
@@ -271,12 +170,12 @@ Alpha Bank exports are detected from their Greek header row and semicolon delimi
 Α/Α;Ημ/νία;Αιτιολογία;Κατάστημα;Τοκισμός από;Αρ. συναλλαγής;Ποσό;Πρόσημο ποσού
 ```
 
-| Greek field | Meaning | Imported as |
+| Field | Meaning | Import behaviour |
 |---|---|---|
-| `Ημ/νία` | Date | Transaction date (`DD/MM/YYYY`) |
-| `Αιτιολογία` | Description/reason | Payee |
+| `Ημ/νία` | Date | Parsed as `DD/MM/YYYY` |
+| `Αιτιολογία` | Description | Payee |
 | `Αρ. συναλλαγής` | Transaction reference | Memo |
-| `Ποσό` | Amount | European numeric format |
+| `Ποσό` | Amount | European decimal parsing |
 | `Πρόσημο ποσού` | Sign | `Χ` debit = negative; `Π` credit = positive |
 
 Examples:
@@ -287,20 +186,39 @@ Examples:
 1.532,76;Χ  -> -1532.76 EUR
 ```
 
-Alpha Bank transactions are treated as EUR by default.
+Alpha Bank rows are treated as EUR by default.
+
+## Account Selection
+
+The source-account picker includes GnuCash asset-like types:
+
+```text
+ASSET, BANK, CASH, CHECKING, STOCK, MUTUAL, RECEIVABLE
+```
+
+This matters because accounts created in GnuCash may be type `BANK`, not generic `ASSET`.
+
+The picker excludes internal accounts:
+
+- `Orphan-GBP`, `Orphan-EUR`, and similar unresolved-split accounts.
+- GUID-like scheduled-transaction template accounts.
+
+Search by partial name if needed:
+
+```text
+Enter number, exact account path (Tab to autocomplete), or search term: alpha
+```
 
 ## Account Matching
 
-The importer proposes destination accounts from:
+Destination suggestions use:
 
 1. Persistent payee mappings.
-2. Existing GnuCash transaction history.
-3. Exact and substring account-name matches.
+2. Existing transaction history.
+3. Exact and partial account-name matches.
 4. Keyword/token overlap against account names.
 
-It down-weights broad history terms such as `transfer` and `payment`, allowing more distinctive terms such as merchants or surnames to have greater influence.
-
-Saved mappings live in:
+Mappings are stored in:
 
 ```text
 .payee_account_mappings.json
@@ -318,44 +236,9 @@ Clear mappings:
 python ./gnucash_importer.py --clear-mappings
 ```
 
-## Creating and Selecting Accounts
-
-When suggestions point to a category, the importer can suggest a logical new account path. For example, parking suggestions under `Expenses:Auto:Parking:*` can lead to:
-
-```text
-Expenses:Auto:Charing Cross Car Park
-```
-
-New accounts are saved immediately before their mapping is persisted.
-
-The manual selector can accept an account path directly. In compatible terminals, press Tab to complete a path and press Tab twice to see alternatives.
-
-## Skipping Transactions
-
-The interactive selector distinguishes between:
-
-```text
-Skip and mark as imported (never ask again)
-Skip for now (ask again next run)
-```
-
-### Permanent Skip
-
-A permanent skip creates no transaction in GnuCash. Instead, it writes a record with `"skipped": true` to:
-
-```text
-.imported_transactions.json
-```
-
-The row will not be offered again in a future import.
-
-### Temporary Skip
-
-A temporary skip writes nothing. The transaction will be offered again next time.
-
 ## Duplicate Detection
 
-The importer uses two independent checks.
+The importer checks duplicates in two ways.
 
 ### Importer History
 
@@ -365,69 +248,65 @@ Rows are hashed from:
 CSV date | payee | amount
 ```
 
-If a hash is already present in `.imported_transactions.json`, the row is skipped.
+Rows already in `.imported_transactions.json` are skipped.
 
 ### Existing Ledger Check
 
-The importer also indexes transactions already in the selected source account using:
+The importer indexes transactions already in the selected source account by:
 
 ```text
 (post_date, signed source-account split amount)
 ```
 
-This detects transactions entered manually or through another GnuCash import workflow.
+This catches manually entered transactions or transactions imported by another method.
 
-When it finds a candidate:
-
-```text
-POSSIBLE DUPLICATE: an existing transaction on 2026-08-19 for the same amount is already in the ledger:
-  'Existing description'
-Is this the same transaction? [Y]es (skip) / n (import anyway):
-```
-
-Disable ledger checking when a file is known to contain entirely new data:
+Disable this additional check when the CSV is known to be entirely new:
 
 ```bash
 --no-ledger-check
 ```
 
-## Dry Run
+## Skip Options
 
-```bash
-python ./gnucash_importer.py \
-  --gnucash-file="portfolio-sqlite.gnucash" \
-  --csv-file="transactions.csv" \
-  --dry-run
+The interactive menu has two skip choices:
+
+```text
+Skip and mark as imported (never ask again)
+Skip for now (ask again next run)
 ```
 
-Dry-run does not create backups, accounts, mappings, skipped records, or transactions.
+Permanent skips do not create a GnuCash transaction. They are recorded with `"skipped": true` in `.imported_transactions.json`.
 
-## Auto-Accept
+## Dry Run and Auto-Accept
+
+Dry-run performs no writes:
 
 ```bash
-python ./gnucash_importer.py \
-  --gnucash-file="portfolio-sqlite.gnucash" \
-  --csv-file="transactions.csv" \
-  --source-account="Assets:Current Assets:Revolut GBP" \
-  --auto-accept
+--dry-run
 ```
 
-Use auto-accept only after reviewing matching quality with dry-runs.
+It does not create backups, accounts, mappings, skipped records, or transactions.
 
-## Income and Expense Reporting
+Auto-accept chooses the strongest suggestion without per-row prompts:
 
-`income_expense_report.py` creates a monthly report from the existing GnuCash SQLite database.
+```bash
+--auto-accept
+```
 
-It is intentionally **read-only**:
+Use it only after reviewing matching behaviour with dry-runs.
 
-- It opens SQLite with `mode=ro`.
-- It does not use piecash.
-- It creates no GnuCash lock.
-- It does not create database backups because it never writes.
+# Income, Expense, and Cash-Flow Reports
 
-The report uses GnuCash account-level **quantity** values instead of transaction-level value fields. This matters for a multi-currency book: quantity is recorded in the account’s own commodity, so EUR expense accounts report in EUR and GBP accounts report in GBP.
+`income_expense_report.py` is a **read-only** report generator.
 
-### Basic Yearly Report
+- Opens SQLite using read-only mode.
+- Does not use piecash.
+- Does not create a GnuCash lock.
+- Does not write prices, transactions, accounts, mappings, or backups.
+
+## Native Currency Reports
+
+Generate separate monthly reports for every currency found in a year:
 
 ```bash
 python ./income_expense_report.py \
@@ -435,9 +314,7 @@ python ./income_expense_report.py \
   --year=2026
 ```
 
-The script prints a separate table for each currency found in the selected year. This avoids incorrectly combining EUR, GBP, and USD into one total.
-
-Each table includes all twelve months, then a final annual total:
+Each report contains twelve monthly rows and an annual total:
 
 ```text
 Month                     Income             Expenses           Net cash flow
@@ -454,20 +331,9 @@ The formula is:
 Net cash flow = Income - Expenses
 ```
 
-Income is shown as positive for readability even though GnuCash normally stores income credits as negative splits internally. Expenses are shown as positive. Refunds and reversals naturally reduce the corresponding totals.
+Income is displayed as positive even though GnuCash normally stores income credits as negative account quantities. Expenses are displayed as positive. Refunds and reversals reduce the relevant total naturally.
 
-### Filter to One Currency
-
-For GBP:
-
-```bash
-python ./income_expense_report.py \
-  --gnucash-file="portfolio-sqlite.gnucash" \
-  --year=2026 \
-  --currency=GBP
-```
-
-For EUR, for example your Alpha Bank reporting:
+Filter to one native currency:
 
 ```bash
 python ./income_expense_report.py \
@@ -476,65 +342,160 @@ python ./income_expense_report.py \
   --currency=EUR
 ```
 
-### Annual Account Breakdown
+## Consolidated Currency Reports
 
-Use `--detail` to print annual totals by individual income and expense account:
+Use `--report-currency` to convert all income and expenses into one selected currency:
 
 ```bash
 python ./income_expense_report.py \
   --gnucash-file="portfolio-sqlite.gnucash" \
   --year=2026 \
-  --currency=GBP \
+  --report-currency=GBP
+```
+
+The report uses the existing **GnuCash Price Database** only. It does not fetch internet rates or change the book.
+
+For each split:
+
+1. The report identifies the source account’s currency.
+2. It searches the Price Database for the closest direct exchange rate to the transaction `post_date`.
+3. If no direct rate exists, it searches for the reverse pair and inverts it.
+4. It converts the split into the selected report currency.
+
+For example, if a €100 expense has an EUR→GBP price of `0.8512`:
+
+```text
+100.00 EUR × 0.8512 = 85.12 GBP
+```
+
+### Rate Tolerance
+
+By default, the nearest stored rate must be within 7 days of the transaction date:
+
+```bash
+--rate-tolerance-days=7
+```
+
+Use a stricter requirement, for example exact-date-only matching:
+
+```bash
+--rate-tolerance-days=0
+```
+
+Use a wider range only if appropriate for your accounting method:
+
+```bash
+--rate-tolerance-days=30
+```
+
+### Missing Rates
+
+Default behaviour is `warn`: rows lacking a usable exchange rate are excluded from consolidated totals and reported in the terminal.
+
+```bash
+--missing-rate=warn
+```
+
+Other modes:
+
+```bash
+--missing-rate=skip
+--missing-rate=fail
+```
+
+`fail` stops immediately when a required rate is missing. This is useful for strict/reproducible financial reporting.
+
+The report intentionally does **not** silently retrieve current online rates for historical transactions. Current rates are inappropriate for historical monthly cash flow and would make a report non-reproducible. Populate GnuCash’s Price Database with appropriate historical currency rates, then re-run the report.
+
+## Conversion Audit CSV
+
+For consolidated reports, create an audit record of every conversion:
+
+```bash
+python ./income_expense_report.py \
+  --gnucash-file="portfolio-sqlite.gnucash" \
+  --year=2026 \
+  --report-currency=GBP \
+  --rate-tolerance-days=7 \
+  --conversion-audit-csv="conversion-audit-2026-gbp.csv"
+```
+
+The audit CSV includes:
+
+```text
+post_date
+account
+account_type
+description
+source_amount
+source_currency
+target_currency
+rate
+rate_date
+rate_source
+distance_days
+converted_amount
+status
+reason
+```
+
+`rate_source` is one of:
+
+```text
+identity
+ognucash-db-direct
+gnucash-db-inverted
+```
+
+A missing rate creates an audit row with `status=missing` and an explanatory `reason`.
+
+## Category Breakdown
+
+Show annual totals by income and expense account:
+
+```bash
+python ./income_expense_report.py \
+  --gnucash-file="portfolio-sqlite.gnucash" \
+  --year=2026 \
+  --report-currency=GBP \
   --detail
 ```
 
-Example output:
+## CSV Summary Export
 
-```text
-Account                                              Annual total
-----------------------------------------------------------------------------
-Expenses:Food:Groceries                                4,200.00 GBP
-Expenses:Auto:Parking                                  1,180.00 GBP
-Income:Salary                                         29,500.00 GBP
-```
-
-### CSV Export
-
-Export the monthly report to a spreadsheet-friendly CSV:
+Export monthly totals to CSV:
 
 ```bash
 python ./income_expense_report.py \
   --gnucash-file="portfolio-sqlite.gnucash" \
   --year=2026 \
-  --currency=EUR \
-  --csv-output="income-expense-2026-eur.csv"
+  --report-currency=GBP \
+  --csv-output="income-expense-2026-gbp.csv"
 ```
 
-The CSV contains 12 monthly rows plus a final `TOTAL` row.
+## Cash-Flow Plot
 
-### Cash-Flow Chart
-
-Generate a PNG chart with income bars, expense bars, and a net cash-flow line:
+Generate a chart with income bars, expense bars, and net-cash-flow line:
 
 ```bash
 python ./income_expense_report.py \
   --gnucash-file="portfolio-sqlite.gnucash" \
   --year=2026 \
-  --currency=GBP \
+  --report-currency=GBP \
   --plot="cashflow-2026-gbp.png"
 ```
 
-Install matplotlib first if necessary:
+Install matplotlib if needed:
 
 ```bash
 pip install matplotlib
 ```
 
-A chart must use one currency. If your selected year contains more than one currency, specify `--currency` explicitly.
+A plot requires one output currency. Use either `--currency` for native reporting or `--report-currency` for a converted consolidated report.
 
-## Import Validation
+# Validation and Recovery
 
-Use `validate_import.py` to compare recorded imports against their original source CSV, particularly for transaction-date validation:
+## Validate Imports
 
 ```bash
 python validate_import.py \
@@ -542,7 +503,7 @@ python validate_import.py \
   --csv-file="transactions.csv"
 ```
 
-Apply detected post-date corrections:
+Apply date corrections:
 
 ```bash
 python validate_import.py \
@@ -551,9 +512,7 @@ python validate_import.py \
   --fix
 ```
 
-## Account Export
-
-Export the account tree to JSON:
+## Export Accounts
 
 ```bash
 python ./gnucash_importer.py \
@@ -561,23 +520,17 @@ python ./gnucash_importer.py \
   --export-accounts
 ```
 
-## SQLite Lock Recovery
+## Stale SQLite Locks
 
-GnuCash SQLite uses an internal `gnclock` table. The importer closes its book in a `finally` block and normally prints:
-
-```text
-GnuCash book closed - lock released.
-```
-
-For a stale lock left by an earlier crash, close GnuCash and every importer process, then run:
+After confirming GnuCash and all importer processes are closed:
 
 ```bash
 python clear_gnclock.py portfolio-sqlite.gnucash
 ```
 
-Only clear a lock when no process is genuinely using the book.
+Do not clear a lock while another process is genuinely writing to the book.
 
-## Persistent Files
+# Persistent Files
 
 | File or directory | Purpose |
 |---|---|
@@ -585,13 +538,11 @@ Only clear a lock when no process is genuinely using the book.
 | `.payee_account_mappings.json` | Payee-to-account mappings |
 | `.transaction_history_analysis.json` | Cached transaction-history analysis |
 | `accounts.json` | Optional account-tree export |
-| `backups/` | Timestamped pre-write SQLite database backups |
-
-Keep these files in the same project directory if you want mappings and importer history to remain consistent.
+| `backups/` | Timestamped importer database backups |
 
 ## Typical Commands
 
-### Revolut review
+### Revolut Review
 
 ```bash
 python ./gnucash_importer.py \
@@ -601,7 +552,7 @@ python ./gnucash_importer.py \
   --dry-run
 ```
 
-### Bank of Scotland import
+### Bank of Scotland Import
 
 ```bash
 python ./gnucash_importer.py \
@@ -610,7 +561,7 @@ python ./gnucash_importer.py \
   --source-account="Assets:Current Assets:BOS Salary Account"
 ```
 
-### Alpha Bank Greece review
+### Alpha Bank Greece Review
 
 ```bash
 python ./gnucash_importer.py \
@@ -624,15 +575,15 @@ python ./gnucash_importer.py \
 
 ### `Invalid argument(s) 'backend' sent to create_engine()`
 
-Remove obsolete `backend="xml"` or `check_exists=False` parameters from `piecash.open_book()`. The importer expects a SQLite book.
+Remove obsolete `backend="xml"` or `check_exists=False` arguments from `piecash.open_book()`. The importer expects SQLite.
 
 ### `GncImbalanceError`
 
-A transaction has unbalanced splits. The importer creates a source-account split and an equal-and-opposite destination split, so this should not occur unless the script has been changed or the source account is invalid.
+A transaction has unbalanced splits. The importer creates a source split and equal/opposite destination split, so this normally indicates a modified script or invalid account setup.
 
-### An account is missing from the source list
+### Source Account Not Found
 
-Search by a partial name at the account prompt:
+Search by a partial name at the source-account prompt:
 
 ```text
 alpha
@@ -640,8 +591,8 @@ revolut
 bos
 ```
 
-The importer includes GnuCash `BANK` accounts in addition to generic `ASSET` accounts.
+The importer considers both `BANK` and generic `ASSET` types.
 
-### `Orphan-*` or GUID/template entries appear
+### Internal Accounts Appear
 
-Use the latest script. Internal unresolved-split accounts and scheduled-transaction template accounts are excluded from source account selection.
+The current importer excludes `Orphan-*` and scheduled-transaction template accounts from source selection. Ensure you are using the latest version.
