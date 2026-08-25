@@ -15,16 +15,26 @@ from config import (
 )
 from importer import TransactionImporter
 from mappings import PayeeAccountMapper, TransactionHistoryAnalyzer
+import warnings
+from sqlalchemy import exc as sa_exc
+
+warnings.filterwarnings("ignore", category=sa_exc.SAWarning)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Import bank CSV into a SQLite GnuCash book")
+    parser = argparse.ArgumentParser(
+        description="Import bank CSV into a SQLite GnuCash book"
+    )
     parser.add_argument("--gnucash-file", default=DEFAULT_GNUCASH_FILE)
     parser.add_argument("--csv-file", default=DEFAULT_CSV_FILE)
     parser.add_argument("--source-account", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--auto-accept", action="store_true")
-    parser.add_argument("--include-pending", action="store_true", help="Include pending Revolut transactions")
+    parser.add_argument(
+        "--include-pending",
+        action="store_true",
+        help="Include pending Revolut transactions",
+    )
     parser.add_argument(
         "--pending-duplicate-window-days",
         type=int,
@@ -61,7 +71,9 @@ def main() -> None:
         importer.dry_run = args.dry_run
         importer.auto_accept = args.auto_accept
         importer.include_pending = args.include_pending
-        importer.pending_duplicate_window_days = max(0, args.pending_duplicate_window_days)
+        importer.pending_duplicate_window_days = max(
+            0, args.pending_duplicate_window_days
+        )
         importer.keep_backups = max(0, args.keep_backups)
         importer.check_ledger = not args.no_ledger_check
         importer.payee_mapper = mapper
@@ -74,16 +86,24 @@ def main() -> None:
         importer.history_analyzer = TransactionHistoryAnalyzer(importer.book)
         importer.history_analyzer.analyze()
         from account_matching import AccountMatcher
-        importer.matcher = AccountMatcher(importer.book, mapper, importer.history_analyzer)
+
+        importer.matcher = AccountMatcher(
+            importer.book, mapper, importer.history_analyzer
+        )
         importer.source_account = importer.resolve_source_account(args.source_account)
         rows = importer.read_csv()
         importer.process_transactions(rows)
 
         if importer.tx_to_create and not args.dry_run:
-            if args.auto_accept or input("Execute import now? [y/N]: ").strip().lower() == "y":
+            if (
+                args.auto_accept
+                or input("Execute import now? [y/N]: ").strip().lower() == "y"
+            ):
                 importer.execute_import()
         elif args.dry_run:
-            print("Dry run complete: no accounts, skipped records, mappings, backups, or transactions were written.")
+            print(
+                "Dry run complete: no accounts, skipped records, mappings, backups, or transactions were written."
+            )
     except KeyboardInterrupt:
         print("Cancelled by user")
     except Exception as exc:
