@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 import difflib
@@ -21,7 +21,13 @@ from config import (
     DUPLICATE_CHECK_FILE,
     SUPPORTED_CURRENCIES,
 )
-from utils import AccountPathCompleter, input_with_completion, is_real_asset_account, normalize_payee, parse_tx_date
+from utils import (
+    AccountPathCompleter,
+    input_with_completion,
+    is_real_asset_account,
+    normalize_payee,
+    parse_tx_date,
+)
 
 
 class TransactionImporter:
@@ -65,7 +71,11 @@ class TransactionImporter:
     def open_book(self, readonly: bool) -> None:
         if not os.path.exists(self.gnucash_file):
             raise FileNotFoundError(f"GnuCash file not found: {self.gnucash_file}")
-        self.book = piecash.open_book(self.gnucash_file, readonly=readonly, open_if_lock=True)
+        self.book = piecash.open_book(
+            self.gnucash_file,
+            readonly=readonly,
+            open_if_lock=True,
+        )
 
     def close_book(self) -> None:
         if self.book is not None:
@@ -90,7 +100,8 @@ class TransactionImporter:
             print(f"Warning: source account '{path_hint}' not found.")
 
         all_accounts = [
-            account for account in self.matcher.accounts_cache.values()
+            account
+            for account in self.matcher.accounts_cache.values()
             if account.type in ASSET_LIKE_TYPES and is_real_asset_account(account)
         ]
         postable = sorted(
@@ -134,7 +145,7 @@ class TransactionImporter:
         return os.path.join(os.path.dirname(self.gnucash_file), "backups")
 
     def _create_database_backup(self) -> None:
-        if self.dry_run or self._backup_created:
+        if self.dry_run or getattr(self, "_backup_created", False):
             return
         backup_dir = self._backup_directory()
         os.makedirs(backup_dir, exist_ok=True)
@@ -160,9 +171,9 @@ class TransactionImporter:
             key=os.path.getmtime,
             reverse=True,
         )
-        for old in backups[self.keep_backups:]:
-            os.remove(old)
-            print(f"Deleted old backup: {old}")
+        for old_backup in backups[self.keep_backups:]:
+            os.remove(old_backup)
+            print(f"Deleted old backup: {old_backup}")
 
     def _get_or_create_commodity(self, code: str):
         code = code.upper()
@@ -200,18 +211,13 @@ class TransactionImporter:
         return max(
             candidates,
             key=lambda item: difflib.SequenceMatcher(
-                None, normalize_payee(tx["payee"]), normalize_payee(item.description or "")
+                None,
+                normalize_payee(tx["payee"]),
+                normalize_payee(item.description or ""),
             ).ratio(),
         )
 
     def _pending_ledger_duplicate(self, tx: dict):
-        """Find a likely posted form of a pending transaction.
-
-        Pending Revolut exports carry Started Date, while a completed export
-        generally has a different Completed Date. Their importer hashes differ,
-        so use source split amount, normalized description similarity, and a
-        date window to identify a likely completed counterpart.
-        """
         if not tx.get("is_pending"):
             return None
         pending_date = parse_tx_date(tx["date"]).date()
@@ -221,20 +227,32 @@ class TransactionImporter:
         best_score = 0.0
 
         for txn in self.book.transactions:
-            if not txn.post_date or abs((txn.post_date - pending_date).days) > self.pending_duplicate_window_days:
+            if not txn.post_date:
+                continue
+            if abs((txn.post_date - pending_date).days) > self.pending_duplicate_window_days:
                 continue
             source_split = next(
-                (split for split in (txn.splits or []) if split.account and split.account.guid == self.source_account.guid),
+                (
+                    split
+                    for split in (txn.splits or [])
+                    if split.account and split.account.guid == self.source_account.guid
+                ),
                 None,
             )
             if source_split is None or round(float(source_split.value), 2) != amount:
                 continue
-            score = difflib.SequenceMatcher(None, payee, normalize_payee(txn.description or "")).ratio()
+            score = difflib.SequenceMatcher(
+                None,
+                payee,
+                normalize_payee(txn.description or ""),
+            ).ratio()
             if score > best_score:
                 best = txn
                 best_score = score
 
-        return (best, best_score) if best is not None and best_score >= 0.55 else None
+        if best is None or best_score < 0.55:
+            return None
+        return best, best_score
 
     def _mark_skipped(self, tx: dict, reason: str) -> None:
         self.imported_tx[tx["import_hash"]] = {
@@ -325,68 +343,171 @@ class TransactionImporter:
                         continue
 
             suggestions = self.matcher.find_matching_accounts(
-                tx["payee"], tx.get("memo", ""), tx["currency"], exclude_guid=self.source_account.guid
+                tx["payee"],
+                tx.get("memo", ""),
+                tx["currency"],
+                exclude_guid=self.source_account.guid,
             )
             if self.dry_run:
-                for account, confidence, reason in suggestions:
-                    print(f"  Suggestion: {account.fullname} ({confidence:.0%}) — {reason}")
+                if suggestions:
+                    for account, confidence, reason in suggestions:
+                        print(f"  Suggestion: {account.fullname} ({confidence:.0%}) — {reason}")
+                else:
+                    print(f"  No suggestion. New-account category fallback: {self.matcher.suggest_category(tx['payee'])}")
                 continue
+
             destination = self._select_account(tx, suggestions)
             if destination:
                 self._prepare_tx(destination, tx)
 
+    def _suggest_new_account_path(self, tx: dict, suggestions: list) -> str:
+        if suggestions:
+            parts = suggestions[0][0].fullname.split(":")
+            if len(parts) >= 2:
+                return f"{':'.join(parts[:2])}:{tx['payee']}"
+        return f"{self.matcher.suggest_category(tx['payee'])}:{tx['payee']}"
+
+    def _create_account_path(self, path: str, tx: dict):
+        parts = [part.strip() for part in path.split(":") if part.strip()]
+        if len(parts) < 2:
+            print("  Account path needs at least two levels, e.g. Expenses:Travel")
+            return None
+
+        parent = None
+        current_path = ""
+        created = False
+        for part in parts:
+            current_path = f"{current_path}:{part}" if current_path else part
+            existing_guid = self.matcher.get_account_guid(current_path)
+            if existing_guid:
+                parent = self.matcher.get_account_by_guid(existing_guid)
+                continue
+
+            self._create_database_backup()
+            account = piecash.Account(
+                name=part,
+                type=self._infer_account_type(current_path),
+                parent=parent if parent else self.book.root_account,
+                commodity=self._get_or_create_commodity(tx["currency"]),
+            )
+            self.book.add(account)
+            self.matcher.accounts_cache[account.guid] = account
+            parent = account
+            created = True
+            print(f"  Created account: {current_path} ({tx['currency']})")
+
+        if created:
+            self.book.save()
+            print(f"  Saved new account structure to {self.gnucash_file}")
+        return parent
+
+    @staticmethod
+    def _infer_account_type(path: str) -> str:
+        root = path.split(":", 1)[0].lower()
+        return {
+            "income": "INCOME",
+            "expenses": "EXPENSE",
+            "expense": "EXPENSE",
+            "assets": "ASSET",
+            "asset": "ASSET",
+            "liabilities": "LIABILITY",
+            "liability": "LIABILITY",
+            "equity": "EQUITY",
+        }.get(root, "EXPENSE")
+
+    def _account_path_completer(self) -> AccountPathCompleter:
+        return AccountPathCompleter(
+            [account.fullname for account in self.matcher.accounts_cache.values()]
+        )
+
+    def _new_account_path_prompt(self, suggested_path: str) -> str:
+        """Prompt for a new account path with the same tab completion as
+        manual account entry. Tab completes the existing account prefix;
+        after completing a parent path, append ':New Account Name'.
+
+        Example:
+          Type 'Expenses:Trav', press Tab, then append ':Eurowings'.
+        """
+        return input_with_completion(
+            f"  New account path (default {suggested_path}; Tab completes existing paths): ",
+            self._account_path_completer(),
+        ).strip() or suggested_path
+
+    def _manual_account_path(self, tx: dict):
+        path = input_with_completion(
+            "  Existing or new account path (Tab to autocomplete): ",
+            self._account_path_completer(),
+        ).strip()
+        if not path:
+            return None
+        guid = self.matcher.get_account_guid(path)
+        if guid:
+            account = self.matcher.get_account_by_guid(guid)
+            print(f"  Using existing account: {account.fullname}")
+            return account
+        return self._create_account_path(path, tx)
+
+    def _offer_mapping_save(self, tx: dict, account) -> None:
+        if account and input("  Save payee mapping? [Y]/n: ").strip().lower() in {"", "y", "yes"}:
+            self.payee_mapper.add_mapping(tx["payee"], account.fullname, account.guid)
+            print(f"  Saved mapping: '{tx['payee']}' -> '{account.fullname}'")
+
     def _select_account(self, tx: dict, suggestions: list):
+        print("\n  Account Selection:")
         for index, (account, confidence, reason) in enumerate(suggestions, 1):
             print(f"  {index}. {account.fullname} ({confidence:.0%}) — {reason}")
-        print(f"  {len(suggestions)+1}. Skip and mark as imported")
-        print(f"  {len(suggestions)+2}. Skip for now")
+
+        new_path = self._suggest_new_account_path(tx, suggestions)
+        create_choice = len(suggestions) + 1
+        manual_choice = len(suggestions) + 2
+        permanent_skip_choice = len(suggestions) + 3
+        temporary_skip_choice = len(suggestions) + 4
+
+        print(f"  {create_choice}. Create new account (suggested: {new_path})")
+        print(f"  {manual_choice}. Enter existing or new account path manually (Tab to autocomplete)")
+        print(f"  {permanent_skip_choice}. Skip and mark as imported (never ask again)")
+        print(f"  {temporary_skip_choice}. Skip for now (ask again next run)")
+
         try:
-            choice = int(input("  Choice: "))
+            choice = int(input(f"  Choice (1-{temporary_skip_choice}): "))
         except ValueError:
+            print("  Invalid selection - skipping for now")
             return None
+
         if 1 <= choice <= len(suggestions):
             account = suggestions[choice - 1][0]
-            if input("  Save mapping? [Y]/n: ").strip().lower() in {"", "y", "yes"}:
-                self.payee_mapper.add_mapping(tx["payee"], account.fullname, account.guid)
+            self._offer_mapping_save(tx, account)
             return account
-        if choice == len(suggestions) + 1:
+
+        if choice == create_choice:
+            # This is intentionally completion-enabled, unlike the previous
+            # implementation that used plain input() at this exact prompt.
+            path = self._new_account_path_prompt(new_path)
+            account = self._create_account_path(path, tx)
+            self._offer_mapping_save(tx, account)
+            return account
+
+        if choice == manual_choice:
+            account = self._manual_account_path(tx)
+            self._offer_mapping_save(tx, account)
+            return account
+
+        if choice == permanent_skip_choice:
             self._mark_skipped(tx, "user skipped and marked as imported")
+            return None
+
+        if choice == temporary_skip_choice:
+            print("  Skipped for now (will be shown again next run)")
+            return None
+
+        print("  Invalid selection - skipping for now")
         return None
-
-    def _backup_directory(self) -> str:
-        return os.path.join(os.path.dirname(self.gnucash_file), "backups")
-
-    def _create_database_backup(self) -> None:
-        if self.dry_run or getattr(self, "_backup_created", False):
-            return
-        directory = self._backup_directory()
-        os.makedirs(directory, exist_ok=True)
-        stem, extension = os.path.splitext(os.path.basename(self.gnucash_file))
-        extension = extension or ".gnucash"
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_path = os.path.join(directory, f"{stem}.backup-{timestamp}{extension}")
-        shutil.copy2(self.gnucash_file, backup_path)
-        self._backup_created = True
-        print(f"Created database backup: {backup_path}")
-        self._prune_backups(directory, stem, extension)
-
-    def _prune_backups(self, directory: str, stem: str, extension: str) -> None:
-        if self.keep_backups <= 0:
-            return
-        prefix = f"{stem}.backup-"
-        backups = sorted(
-            (os.path.join(directory, name) for name in os.listdir(directory) if name.startswith(prefix) and name.endswith(extension)),
-            key=os.path.getmtime,
-            reverse=True,
-        )
-        for old_backup in backups[self.keep_backups:]:
-            os.remove(old_backup)
-            print(f"Deleted old backup: {old_backup}")
 
     def execute_import(self) -> None:
         if not self.tx_to_create:
             print("No transactions to import")
             return
+
         self._create_database_backup()
         for info in self.tx_to_create:
             post_date = parse_tx_date(info["date"])
@@ -397,8 +518,16 @@ class TransactionImporter:
                 post_date=post_date.date(),
                 enter_date=datetime.now(),
                 splits=[
-                    piecash.Split(account=info["source_account"], value=amount, memo=info["memo"][:200]),
-                    piecash.Split(account=info["dest_account"], value=-amount, memo=info["memo"][:200]),
+                    piecash.Split(
+                        account=info["source_account"],
+                        value=amount,
+                        memo=info["memo"][:200],
+                    ),
+                    piecash.Split(
+                        account=info["dest_account"],
+                        value=-amount,
+                        memo=info["memo"][:200],
+                    ),
                 ],
             )
             self.book.add(transaction)
@@ -412,6 +541,7 @@ class TransactionImporter:
                 "csv_date": info["date"],
                 "tx_guid": transaction.guid,
             }
+
         self.book.save()
         self._save_imported()
         print(f"Saved {len(self.tx_to_create)} transactions")
