@@ -1,7 +1,7 @@
 """CSV detection and parsers for supported bank exports."""
 
 import csv
-from typing import Iterable, List, Tuple
+from typing import List, Tuple
 
 from config import ALPHA_GR_HEADER_MARKER, BASE_CURRENCY, BOS_TYPE_DESCRIPTIONS
 
@@ -29,6 +29,15 @@ class BankFormatMapper:
 
     @staticmethod
     def map_bof_scot(row: dict) -> dict:
+        """Parse either known Bank of Scotland CSV variant.
+
+        Statement-style export:
+          Date, Description, Type, Money In (£), Money Out (£), Balance (£)
+
+        Online-banking transaction export:
+          Transaction Date, Transaction Type, Sort Code, Account Number,
+          Transaction Description, Debit Amount, Credit Amount, Balance
+        """
         def clean_amount(raw) -> float:
             raw = (raw or "").strip()
             if not raw or raw.lower() == "blank":
@@ -38,12 +47,30 @@ class BankFormatMapper:
             except ValueError:
                 return 0.0
 
-        type_code = (row.get("Type") or "").strip().upper()
+        type_code = (row.get("Transaction Type") or row.get("Type") or "").strip().upper()
+        date_value = row.get("Transaction Date") or row.get("Date") or row.get("Posting Date") or row.get("Value Date", "")
+        payee = row.get("Transaction Description") or row.get("Description") or row.get("Payee", "")
+
+        # Both BoS formats use the same debit/credit semantic; only the
+        # header labels differ. Debit/outgoing money is negative, credit/
+        # incoming money is positive.
+        money_in = clean_amount(
+            row.get("Credit Amount")
+            or row.get("Money In (£)")
+            or row.get("Money In")
+            or row.get("Credit")
+        )
+        money_out = clean_amount(
+            row.get("Debit Amount")
+            or row.get("Money Out (£)")
+            or row.get("Money Out")
+            or row.get("Debit")
+        )
+
         return {
-            "date": row.get("Date") or row.get("Posting Date") or row.get("Value Date", ""),
-            "payee": row.get("Description") or row.get("Payee", ""),
-            "amount": clean_amount(row.get("Money In (£)") or row.get("Money In") or row.get("Credit"))
-            - clean_amount(row.get("Money Out (£)") or row.get("Money Out") or row.get("Debit")),
+            "date": date_value,
+            "payee": payee,
+            "amount": money_in - money_out,
             "currency": BASE_CURRENCY,
             "memo": BOS_TYPE_DESCRIPTIONS.get(type_code, type_code) or row.get("Reference") or row.get("Notes", ""),
             "is_pending": False,
@@ -102,25 +129,56 @@ class BankFormatMapper:
                         return "alpha_gr"
                 handle.seek(0)
                 header = next(csv.reader(handle))
+
             lower_header = [cell.strip().lower() for cell in header]
             original_header = [cell.strip() for cell in header]
+
             if any("counterparty" in cell for cell in lower_header) or sum(
-                signal in lower_header for signal in ("started date", "completed date", "product", "state")
+                signal in lower_header
+                for signal in ("started date", "completed date", "product", "state")
             ) >= 2:
                 return "revolut"
+
+            # Bank of Scotland online-banking export, as opposed to the
+            # statement-style Date/Money In/Money Out export.
+            if (
+                "transaction date" in lower_header
+                and "transaction description" in lower_header
+                and "transaction type" in lower_header
+                and ("debit amount" in lower_header or "credit amount" in lower_header)
+            ):
+                return "bof_scot"
+
             if any("posting date" == cell.lower() for cell in original_header) or any(
                 "posting date" in cell for cell in lower_header
             ):
                 return "bof_scot"
-            if sum(any(signal in cell for signal in ("money in", "money out", "balance")) for cell in lower_header) >= 2 and any(
-                "type" in cell for cell in lower_header
-            ):
+            if sum(
+                any(signal in cell for signal in ("money in", "money out", "balance"))
+                for cell in lower_header
+            ) >= 2 and any("type" in cell for cell in lower_header):
                 return "bof_scot"
+
             if all(any(required in cell for cell in lower_header) for required in ("date", "payee", "amount")):
                 return "generic"
         except Exception as exc:
             print(f"Warning: could not detect bank format: {exc}")
         return "generic"
+
+
+def _is_valid_mapped_transaction(mapped: dict) -> Tuple[bool, str]:
+    """Reject malformed mappings before they reach duplicate checks.
+
+    This prevents an incorrectly detected/exported CSV from producing a
+    fake blank row such as: date='', payee='', amount=0.00.
+    """
+    if not str(mapped.get("date") or "").strip():
+        return False, "missing transaction date"
+    if not str(mapped.get("payee") or "").strip():
+        return False, "missing transaction description/payee"
+    if mapped.get("amount") is None:
+        return False, "missing transaction amount"
+    return True, ""
 
 
 def read_bank_csv(csv_file: str, include_pending: bool = False) -> Tuple[str, List[dict]]:
@@ -139,9 +197,12 @@ def read_bank_csv(csv_file: str, include_pending: bool = False) -> Tuple[str, Li
                 break
 
     rows = []
+    skipped_pending = 0
+    skipped_invalid = 0
     for row_number, row in enumerate(csv.DictReader(lines[start_index:], delimiter=delimiter), 1):
         if not any(str(value).strip() for value in row.values()):
             continue
+
         if fmt == "revolut":
             mapped = mapper.map_revolut(row)
         elif fmt == "bof_scot":
@@ -150,9 +211,21 @@ def read_bank_csv(csv_file: str, include_pending: bool = False) -> Tuple[str, Li
             mapped = mapper.map_alpha_gr(row)
         else:
             mapped = mapper.map_generic(row)
-        if mapped["is_pending"] and not include_pending:
+
+        valid, reason = _is_valid_mapped_transaction(mapped)
+        if not valid:
+            skipped_invalid += 1
+            print(f"Skipping malformed CSV row {row_number}: {reason}")
             continue
+        if mapped["is_pending"] and not include_pending:
+            skipped_pending += 1
+            continue
+
         mapped["row_number"] = row_number
         rows.append(mapped)
 
+    if skipped_pending:
+        print(f"Skipped {skipped_pending} pending transaction(s); use --include-pending to include them")
+    if skipped_invalid:
+        print(f"Skipped {skipped_invalid} malformed/unmapped CSV row(s)")
     return fmt, rows
