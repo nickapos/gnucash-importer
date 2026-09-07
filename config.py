@@ -13,7 +13,14 @@ TRANSACTION_HISTORY_FILE = ".transaction_history_analysis.json"
 ACCOUNTS_EXPORT_FILE = "accounts.json"
 
 SUPPORTED_CURRENCIES = {"GBP", "USD", "EUR"}
-ASSET_LIKE_TYPES = {
+
+# These are account types that may legitimately be the source of a bank or
+# card statement import. They include both asset-side accounts (bank/current/
+# savings/cash) and liability-side accounts (credit cards and loans). GnuCash
+# represents credit cards using the distinct CREDIT type, so omitting CREDIT
+# prevents a card account from ever appearing in source selection.
+SOURCE_ACCOUNT_TYPES = {
+    # Asset-side account types.
     "ASSET",
     "BANK",
     "CASH",
@@ -21,7 +28,15 @@ ASSET_LIKE_TYPES = {
     "STOCK",
     "MUTUAL",
     "RECEIVABLE",
+
+    # Liability-side statement account types.
+    "CREDIT",
+    "LIABILITY",
 }
+
+# Compatibility alias for any older module that still imports this name.
+# New code should import SOURCE_ACCOUNT_TYPES instead.
+ASSET_LIKE_TYPES = SOURCE_ACCOUNT_TYPES
 
 BOS_TYPE_DESCRIPTIONS = {
     "BGC": "Bank Giro Credit",
@@ -43,4 +58,6 @@ BOS_TYPE_DESCRIPTIONS = {
     "TFR": "Transfer",
 }
 
+# Alpha Bank Greece account export header marker. Alpha CSV exports have a
+# metadata preamble before this header row.
 ALPHA_GR_HEADER_MARKER = "Α/Α"

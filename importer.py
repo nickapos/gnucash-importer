@@ -15,7 +15,7 @@ import piecash
 from bank_formats import read_bank_csv
 from config import (
     ACCOUNTS_EXPORT_FILE,
-    ASSET_LIKE_TYPES,
+    SOURCE_ACCOUNT_TYPES,
     DEFAULT_KEEP_BACKUPS,
     DEFAULT_PENDING_DUPLICATE_WINDOW_DAYS,
     DUPLICATE_CHECK_FILE,
@@ -102,13 +102,13 @@ class TransactionImporter:
         all_accounts = [
             account
             for account in self.matcher.accounts_cache.values()
-            if account.type in ASSET_LIKE_TYPES and is_real_asset_account(account)
+            if account.type in SOURCE_ACCOUNT_TYPES and is_real_asset_account(account)
         ]
         postable = sorted(
             (account for account in all_accounts if account.placeholder == 0),
             key=lambda account: account.fullname,
         )
-        print(f"\nFound {len(all_accounts)} asset-like accounts ({len(postable)} postable).")
+        print(f"\nFound {len(all_accounts)} eligible statement-source accounts ({len(postable)} postable).")
         for index, account in enumerate(postable, 1):
             currency = account.commodity.mnemonic if account.commodity else "?"
             print(f"  {index}. {account.fullname} [{account.type}] ({currency})")
