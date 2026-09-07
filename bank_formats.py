@@ -1,4 +1,4 @@
-"""CSV detection and parsers for supported bank exports."""
+"""CSV detection and parsers for supported bank and credit-card exports."""
 
 import csv
 from typing import List, Tuple
@@ -24,12 +24,13 @@ class BankFormatMapper:
             "memo": " / ".join(memo_parts) if memo_parts else row.get("notes", ""),
             "state": state,
             "is_pending": state.strip().upper() == "PENDING",
+            "source_kind": "bank",
             "original_row": row,
         }
 
     @staticmethod
     def map_bof_scot(row: dict) -> dict:
-        """Parse either known Bank of Scotland CSV variant.
+        """Parse either known Bank of Scotland current-account CSV variant.
 
         Statement-style export:
           Date, Description, Type, Money In (£), Money Out (£), Balance (£)
@@ -50,10 +51,6 @@ class BankFormatMapper:
         type_code = (row.get("Transaction Type") or row.get("Type") or "").strip().upper()
         date_value = row.get("Transaction Date") or row.get("Date") or row.get("Posting Date") or row.get("Value Date", "")
         payee = row.get("Transaction Description") or row.get("Description") or row.get("Payee", "")
-
-        # Both BoS formats use the same debit/credit semantic; only the
-        # header labels differ. Debit/outgoing money is negative, credit/
-        # incoming money is positive.
         money_in = clean_amount(
             row.get("Credit Amount")
             or row.get("Money In (£)")
@@ -66,7 +63,6 @@ class BankFormatMapper:
             or row.get("Money Out")
             or row.get("Debit")
         )
-
         return {
             "date": date_value,
             "payee": payee,
@@ -74,6 +70,46 @@ class BankFormatMapper:
             "currency": BASE_CURRENCY,
             "memo": BOS_TYPE_DESCRIPTIONS.get(type_code, type_code) or row.get("Reference") or row.get("Notes", ""),
             "is_pending": False,
+            "source_kind": "bank",
+            "original_row": row,
+        }
+
+    @staticmethod
+    def map_credit_card(row: dict) -> dict:
+        """Parse the credit-card CSV layout:
+
+          Transaction Date, Transaction Cleared Date, Transaction Type,
+          Transaction Description, Transaction Amount
+
+        This export represents ordinary card purchases as positive values.
+        The importer uses a source-split convention where an outgoing bank
+        payment is negative. A credit-card purchase increases the liability,
+        so it is likewise converted to a negative source amount. Negative
+        export values are therefore treated as credits/refunds and converted
+        to positive amounts, reducing the card liability.
+        """
+        raw_amount = row.get("Transaction Amount") or "0"
+        try:
+            exported_amount = float(
+                str(raw_amount).replace("£", "").replace(",", "").strip()
+            )
+        except ValueError:
+            exported_amount = 0.0
+
+        amount = -exported_amount
+        transaction_type = (row.get("Transaction Type") or "").strip()
+        cleared_date = (row.get("Transaction Cleared Date") or "").strip()
+        memo_parts = [part for part in [transaction_type, f"Cleared: {cleared_date}" if cleared_date else ""] if part]
+
+        return {
+            "date": row.get("Transaction Date") or "",
+            "payee": row.get("Transaction Description") or "",
+            "amount": amount,
+            "currency": BASE_CURRENCY,
+            "memo": " / ".join(memo_parts),
+            "cleared_date": cleared_date,
+            "is_pending": not bool(cleared_date),
+            "source_kind": "credit_card",
             "original_row": row,
         }
 
@@ -97,6 +133,7 @@ class BankFormatMapper:
             "currency": "EUR",
             "memo": f"Ref: {reference}" if reference else "",
             "is_pending": False,
+            "source_kind": "bank",
             "original_row": row,
         }
 
@@ -114,6 +151,7 @@ class BankFormatMapper:
             "currency": lower.get("currency", "").upper() or BASE_CURRENCY,
             "memo": lower.get("memo", ""),
             "is_pending": False,
+            "source_kind": "bank",
             "original_row": row,
         }
 
@@ -133,14 +171,24 @@ class BankFormatMapper:
             lower_header = [cell.strip().lower() for cell in header]
             original_header = [cell.strip() for cell in header]
 
+            # Credit-card format has exactly one Transaction Amount column,
+            # not current-account Debit Amount/Credit Amount columns.
+            if (
+                "transaction date" in lower_header
+                and "transaction description" in lower_header
+                and "transaction type" in lower_header
+                and "transaction amount" in lower_header
+                and "debit amount" not in lower_header
+                and "credit amount" not in lower_header
+            ):
+                return "credit_card"
+
             if any("counterparty" in cell for cell in lower_header) or sum(
                 signal in lower_header
                 for signal in ("started date", "completed date", "product", "state")
             ) >= 2:
                 return "revolut"
 
-            # Bank of Scotland online-banking export, as opposed to the
-            # statement-style Date/Money In/Money Out export.
             if (
                 "transaction date" in lower_header
                 and "transaction description" in lower_header
@@ -167,11 +215,6 @@ class BankFormatMapper:
 
 
 def _is_valid_mapped_transaction(mapped: dict) -> Tuple[bool, str]:
-    """Reject malformed mappings before they reach duplicate checks.
-
-    This prevents an incorrectly detected/exported CSV from producing a
-    fake blank row such as: date='', payee='', amount=0.00.
-    """
     if not str(mapped.get("date") or "").strip():
         return False, "missing transaction date"
     if not str(mapped.get("payee") or "").strip():
@@ -207,6 +250,8 @@ def read_bank_csv(csv_file: str, include_pending: bool = False) -> Tuple[str, Li
             mapped = mapper.map_revolut(row)
         elif fmt == "bof_scot":
             mapped = mapper.map_bof_scot(row)
+        elif fmt == "credit_card":
+            mapped = mapper.map_credit_card(row)
         elif fmt == "alpha_gr":
             mapped = mapper.map_alpha_gr(row)
         else:
