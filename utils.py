@@ -1,8 +1,14 @@
 """Shared parsing, text normalization, and terminal helpers."""
 
+import hashlib
+import json
+import os
 import re
+import tempfile
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Set
+
+from config import IGNORED_WORDS
 
 
 def parse_tx_date(date_str: str) -> datetime:
@@ -13,9 +19,12 @@ def parse_tx_date(date_str: str) -> datetime:
     formats = (
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%d",
         "%d %b %y",
         "%d %b %Y",
+        "%d %B %y",
+        "%d %B %Y",
         "%d-%b-%y",
         "%d/%m/%Y %H:%M:%S",
         "%d/%m/%Y",
@@ -34,6 +43,48 @@ def normalize_payee(value: str) -> str:
     value = (value or "").lower()
     value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
     return " ".join(value.split())
+
+
+def compute_tx_hash(tx: dict) -> str:
+    """Stable content hash for a mapped CSV row.
+
+    Shared by the importer and the validation tool so both always agree on
+    which rows have already been handled.
+    """
+    raw = f"{tx['date']}|{tx['payee']}|{float(tx['amount']):.2f}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def tokenize(text: str) -> Set[str]:
+    """Split text into lowercased meaningful words, dropping stop words.
+
+    ``[^\\w\\s]`` (with re.UNICODE) keeps accented and non-Latin letters,
+    mirroring ``normalize_payee`` so Greek (Alpha Bank) and other localized
+    payees are never silently reduced to an empty token set.
+    """
+    cleaned = re.sub(r"[^\w\s]", " ", (text or "").lower(), flags=re.UNICODE)
+    return {
+        word
+        for word in cleaned.split()
+        if len(word) > 2 and word not in IGNORED_WORDS
+    }
+
+
+def atomic_write_json(path: str, data) -> None:
+    """Write JSON to ``path`` atomically (temp file + os.replace)."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def is_real_asset_account(account) -> bool:

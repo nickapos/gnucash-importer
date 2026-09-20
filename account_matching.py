@@ -2,6 +2,8 @@
 
 from typing import Optional, Set
 
+from utils import tokenize
+
 
 class AccountMatcher:
     def __init__(self, book, payee_mapper, history_analyzer):
@@ -13,18 +15,18 @@ class AccountMatcher:
     @staticmethod
     def _acct_currency_matches(account, currency: str) -> bool:
         commodity = getattr(account, "commodity", None)
-        return bool(
-            commodity
-            and commodity.namespace == "CURRENCY"
-            and commodity.mnemonic.upper() == currency.upper()
-        )
+        if not (currency and commodity):
+            return False
+        if getattr(commodity, "namespace", None) != "CURRENCY":
+            return False
+        mnemonic = getattr(commodity, "mnemonic", None)
+        return bool(mnemonic and mnemonic.upper() == currency.upper())
 
     @staticmethod
     def _tokens(text: str) -> Set[str]:
-        import re
-        text = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
-        ignored = {"the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by"}
-        return {word for word in text.split() if len(word) > 2 and word not in ignored}
+        # Delegate to the shared tokenizer (config.IGNORED_WORDS) so matching
+        # and history analysis cannot drift apart.
+        return tokenize(text)
 
     def get_account_by_guid(self, guid: str):
         return self.accounts_cache.get(guid)
@@ -72,11 +74,11 @@ class AccountMatcher:
             suggestions = [item for item in suggestions if item[0].guid != exclude_guid]
 
         best = {}
-        for account, confidence, reason in suggestions:
-            if account.guid not in best or confidence > best[account.guid][0]:
-                best[account.guid] = (confidence, reason, account)
+        for acc, confidence, reason in suggestions:
+            if acc.guid not in best or confidence > best[acc.guid][0]:
+                best[acc.guid] = (confidence, reason, acc)
         return sorted(
-            [(account, confidence, reason) for account, (confidence, reason, account) in best.items()],
+            [(acc, conf, reason) for guid, (conf, reason, acc) in best.items()],
             key=lambda item: item[1],
             reverse=True,
         )[:max_suggestions]
@@ -84,14 +86,18 @@ class AccountMatcher:
     @staticmethod
     def suggest_category(payee: str) -> str:
         text = payee.lower()
-        if any(word in text for word in ["tesco", "sainsbury", "asda", "supermarket", "aldi", "lidl"]):
+        # Improved word matching with word boundaries to avoid false positives
+        import re
+        words = set(re.findall(r'\b\w+\b', text))
+
+        if any(word in words for word in ["tesco", "sainsbury", "sainsburys", "asda", "supermarket", "aldi", "lidl"]):
             return "Expenses:Food"
-        if any(word in text for word in ["amazon", "ebay", "shop", "retail", "argos"]):
+        if any(word in words for word in ["amazon", "ebay", "shop", "retail", "argos"]):
             return "Expenses:Shopping"
-        if any(word in text for word in ["shell", "bp", "esso", "petrol", "fuel", "uber", "train", "bus"]):
+        if any(word in words for word in ["shell", "bp", "esso", "petrol", "fuel", "uber", "train", "bus"]):
             return "Expenses:Transportation"
-        if any(word in text for word in ["netflix", "spotify", "subscription", "disney", "prime"]):
+        if any(word in words for word in ["netflix", "spotify", "subscription", "disney", "prime"]):
             return "Expenses:Subscriptions"
-        if any(word in text for word in ["salary", "wages", "payroll", "hmrc"]):
+        if any(word in words for word in ["salary", "wages", "payroll", "hmrc"]):
             return "Income:Salary"
         return "Expenses:Miscellaneous"

@@ -2,13 +2,13 @@
 
 import json
 import os
-import re
 import difflib
 from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from config import MAPPINGS_FILE, TRANSACTION_HISTORY_FILE
+from utils import atomic_write_json, tokenize
 
 
 class PayeeAccountMapper:
@@ -29,16 +29,23 @@ class PayeeAccountMapper:
             return {}
 
     def save(self) -> None:
-        with open(self.mappings_file, "w") as handle:
-            json.dump(self.mappings, handle, indent=2, sort_keys=True)
+        # Atomic write so a crash cannot corrupt the mapping store.
+        atomic_write_json(self.mappings_file, self.mappings)
 
     def get_mapping(self, payee: str) -> Optional[Dict]:
         if payee in self.mappings:
             return self.mappings[payee]
-        normalized = payee.lower().strip()
+
+        # Token-subset matching avoids false positives such as a mapping for
+        # "amazon" wrongly applying to "amazonian restaurant".
+        query_tokens = tokenize(payee)
+        if not query_tokens:
+            return None
         for known_payee, mapping in self.mappings.items():
-            known = known_payee.lower().strip()
-            if len(known) >= 3 and len(normalized) >= 3 and (known in normalized or normalized in known):
+            known_tokens = tokenize(known_payee)
+            if not known_tokens:
+                continue
+            if known_tokens <= query_tokens or query_tokens <= known_tokens:
                 return mapping
         return None
 
@@ -79,14 +86,39 @@ class TransactionHistoryAnalyzer:
 
     @staticmethod
     def extract_words(text: str) -> List[str]:
-        text = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
-        stop_words = {"the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by"}
-        return [word for word in text.split() if len(word) > 2 and word not in stop_words]
+        # Delegates to the shared tokenizer so stop-word handling is identical
+        # everywhere.
+        return sorted(tokenize(text))
 
-    def analyze(self, max_transactions: int = 1000) -> None:
+    @staticmethod
+    def _sortable_datetime(value):
+        """Normalize a date/datetime/None transaction field for sorting.
+
+        GnuCash stores post_date as a plain ``date`` but enter_date as a
+        ``datetime``; comparing the two directly raises TypeError in Python 3
+        inside ``list.sort``, so convert everything to ``datetime`` first.
+        """
+        if value is None:
+            return datetime.now()
+        if isinstance(value, datetime):
+            return value
+        # Plain datetime.date (not a datetime) -> midnight of that day.
+        try:
+            return datetime.combine(value, datetime.min.time())
+        except TypeError:
+            return datetime.now()
+
+    def analyze(self, max_transactions: int = 1000, write_cache: bool = True) -> None:
         print("Analyzing transaction history...")
+        # Reset both accumulators so calling analyze() more than once can
+        # never double-count the same book history.
+        self.payee_to_accounts = defaultdict(list)
+        self.word_patterns = defaultdict(Counter)
         transactions = list(self.book.transactions)
-        transactions.sort(key=lambda txn: txn.post_date or txn.enter_date, reverse=True)
+        transactions.sort(
+            key=lambda txn: self._sortable_datetime(txn.post_date or txn.enter_date),
+            reverse=True,
+        )
         usage = defaultdict(Counter)
 
         for txn in transactions[:max_transactions]:
@@ -113,12 +145,18 @@ class TransactionHistoryAnalyzer:
             "payee_mappings": self.payee_to_accounts,
             "word_patterns": {word: dict(counts.most_common(10)) for word, counts in self.word_patterns.items()},
         }
-        try:
-            with open(self.analysis_file, "w") as handle:
-                json.dump(cache, handle, indent=2)
-        except Exception as exc:
-            print(f"Could not save history analysis: {exc}")
-        print(f"Analyzed {min(len(transactions), max_transactions)} transactions, found {len(self.payee_to_accounts)} unique payees")
+        # Respect dry-run: never write the cache file when write_cache is False.
+        if write_cache:
+            try:
+                atomic_write_json(self.analysis_file, cache)
+            except Exception as exc:
+                print(f"Could not save history analysis: {exc}")
+        else:
+            print("Dry run: history analysis cache not written")
+        print(
+            f"Analyzed {min(len(transactions), max_transactions)} transactions, "
+            f"found {len(self.payee_to_accounts)} unique payees"
+        )
 
     def suggest_mapping(self, payee: str, description: str = "") -> List[Tuple[str, float, str]]:
         suggestions = []

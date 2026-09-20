@@ -5,6 +5,7 @@ import argparse
 import os
 import traceback
 
+from account_matching import AccountMatcher
 from config import (
     ACCOUNTS_EXPORT_FILE,
     DEFAULT_CSV_FILE,
@@ -19,6 +20,17 @@ import warnings
 from sqlalchemy import exc as sa_exc
 
 warnings.filterwarnings("ignore", category=sa_exc.SAWarning)
+
+
+def non_negative_int(value: str) -> int:
+    """argparse type that rejects negative integers with a clear message."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer value: {value!r}")
+    if number < 0:
+        raise argparse.ArgumentTypeError("value must be zero or greater")
+    return number
 
 
 def main() -> None:
@@ -37,12 +49,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--pending-duplicate-window-days",
-        type=int,
+        type=non_negative_int,
         default=DEFAULT_PENDING_DUPLICATE_WINDOW_DAYS,
         help="Date window used to match pending rows to completed ledger entries (default: 7)",
     )
     parser.add_argument("--no-ledger-check", action="store_true")
-    parser.add_argument("--keep-backups", type=int, default=DEFAULT_KEEP_BACKUPS)
+    parser.add_argument(
+        "--keep-backups",
+        type=non_negative_int,
+        default=DEFAULT_KEEP_BACKUPS,
+        help="How many timestamped backups to retain (default: 10)",
+    )
     parser.add_argument("--list-mappings", action="store_true")
     parser.add_argument("--clear-mappings", action="store_true")
     parser.add_argument("--clear-history", action="store_true")
@@ -71,10 +88,9 @@ def main() -> None:
         importer.dry_run = args.dry_run
         importer.auto_accept = args.auto_accept
         importer.include_pending = args.include_pending
-        importer.pending_duplicate_window_days = max(
-            0, args.pending_duplicate_window_days
-        )
-        importer.keep_backups = max(0, args.keep_backups)
+        # Values are already validated as non-negative by argparse.
+        importer.pending_duplicate_window_days = args.pending_duplicate_window_days
+        importer.keep_backups = args.keep_backups
         importer.check_ledger = not args.no_ledger_check
         importer.payee_mapper = mapper
         importer.open_book(readonly=args.dry_run)
@@ -84,8 +100,8 @@ def main() -> None:
             return
 
         importer.history_analyzer = TransactionHistoryAnalyzer(importer.book)
-        importer.history_analyzer.analyze()
-        from account_matching import AccountMatcher
+        # Never write the history cache during a dry run.
+        importer.history_analyzer.analyze(write_cache=not args.dry_run)
 
         importer.matcher = AccountMatcher(
             importer.book, mapper, importer.history_analyzer

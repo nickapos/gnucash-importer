@@ -135,6 +135,8 @@ def fetch_report_splits(conn: sqlite3.Connection, year: int) -> Iterable[sqlite3
 def transaction_date(value) -> date:
     text = str(value or "")
     # GnuCash stores date columns with a date prefix in its SQLite backend.
+    if not text:
+        raise ValueError("empty date")
     return datetime.strptime(text[:10], "%Y-%m-%d").date()
 
 
@@ -334,7 +336,12 @@ def make_report(
                     raise RuntimeError(
                         f"Missing exchange rate: {audit['reason']} — account {account_name}"
                     )
-                # "warn" and "skip" both exclude unconvertible records.
+                if missing_rate == "warn":
+                    print(
+                        f"WARNING: excluding split on {audit['post_date']} "
+                        f"({account_name}): {audit['reason']}"
+                    )
+                # Both "warn" and "skip" exclude unconvertible records.
                 continue
             amount = conversion["converted_amount"]
         else:
@@ -406,7 +413,7 @@ def print_category_breakdown(currency: str, categories: dict, year: int) -> None
 def write_summary_csv(path: str, all_monthly: dict, year: int) -> None:
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["year", "currency", "month_number", "month", "income", "expenses", "net_cash_flow"])
+        writer.writerow(["year", "currency", "row_type", "month_number", "month", "income", "expenses", "net_cash_flow"])
         for currency, by_month in sorted(all_monthly.items()):
             total_income = Decimal("0")
             total_expense = Decimal("0")
@@ -417,10 +424,10 @@ def write_summary_csv(path: str, all_monthly: dict, year: int) -> None:
                 total_income += income
                 total_expense += expense
                 writer.writerow(
-                    [year, currency, month, calendar.month_name[month], str(income), str(expense), str(income - expense)]
+                    [year, currency, "month", month, calendar.month_name[month], str(income), str(expense), str(income - expense)]
                 )
             writer.writerow(
-                [year, currency, "TOTAL", "Year total", str(total_income), str(total_expense), str(total_income - total_expense)]
+                [year, currency, "total", "", "Year total", str(total_income), str(total_expense), str(total_income - total_expense)]
             )
     print(f"Wrote summary CSV: {path}")
 

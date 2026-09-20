@@ -14,6 +14,19 @@ ACCOUNTS_EXPORT_FILE = "accounts.json"
 
 SUPPORTED_CURRENCIES = {"GBP", "USD", "EUR"}
 
+# Stop words ignored by payee/token matching. Centralised here so that
+# account_matching.py, mappings.py and utils.py cannot drift apart.
+IGNORED_WORDS = {
+    "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+}
+
+# Duplicate-detection thresholds (payee similarity, 0..1).
+EXACT_DUPLICATE_MIN_SIMILARITY = 0.80
+PENDING_DUPLICATE_MIN_SIMILARITY = 0.55
+
+# How many preamble lines to scan when hunting for the Alpha Bank header row.
+ALPHA_GR_MAX_PREAMBLE_LINES = 50
+
 # These are account types that may legitimately be the source of a bank or
 # card statement import. They include both asset-side accounts (bank/current/
 # savings/cash) and liability-side accounts (credit cards and loans). GnuCash

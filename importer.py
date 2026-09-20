@@ -1,10 +1,10 @@
 """Core GnuCash import workflow and duplicate detection."""
 
-import hashlib
 import json
 import os
 import shutil
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
@@ -19,15 +19,27 @@ from config import (
     DEFAULT_KEEP_BACKUPS,
     DEFAULT_PENDING_DUPLICATE_WINDOW_DAYS,
     DUPLICATE_CHECK_FILE,
+    EXACT_DUPLICATE_MIN_SIMILARITY,
+    PENDING_DUPLICATE_MIN_SIMILARITY,
     SUPPORTED_CURRENCIES,
 )
 from utils import (
     AccountPathCompleter,
+    atomic_write_json,
+    compute_tx_hash,
     input_with_completion,
     is_real_asset_account,
     normalize_payee,
     parse_tx_date,
 )
+
+
+@dataclass
+class DuplicateMatch:
+    """A candidate existing transaction and how closely it matches."""
+
+    txn: object
+    similarity: float
 
 
 class TransactionImporter:
@@ -47,6 +59,7 @@ class TransactionImporter:
         self.check_ledger = True
         self._backup_created = False
         self._existing_ledger_index = None
+        self._pending_ledger_index = None
         self.tx_to_create = []
         self.imported_tx = self._load_imported()
 
@@ -56,17 +69,20 @@ class TransactionImporter:
         try:
             with open(DUPLICATE_CHECK_FILE, "r") as handle:
                 return json.load(handle)
-        except Exception:
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"Warning: could not read {DUPLICATE_CHECK_FILE}: {exc}")
+            print("  Starting with empty import history.")
             return {}
 
     def _save_imported(self) -> None:
-        with open(DUPLICATE_CHECK_FILE, "w") as handle:
-            json.dump(self.imported_tx, handle, indent=2)
+        # Atomic write so an interrupted run cannot corrupt the history file.
+        atomic_write_json(DUPLICATE_CHECK_FILE, self.imported_tx)
 
     @staticmethod
     def tx_hash(tx: dict) -> str:
-        raw = f"{tx['date']}|{tx['payee']}|{tx['amount']:.2f}"
-        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+        # Single shared implementation (utils.compute_tx_hash) so the
+        # validation tool always reproduces the same hashes.
+        return compute_tx_hash(tx)
 
     def open_book(self, readonly: bool) -> None:
         if not os.path.exists(self.gnucash_file):
@@ -81,6 +97,21 @@ class TransactionImporter:
         if self.book is not None:
             self.book.close()
             print("GnuCash book closed - lock released.")
+
+    def export_accounts_json(self, path: str) -> None:
+        """Write every account in the book to a JSON file for inspection."""
+        payload = []
+        for account in sorted(self.book.accounts, key=lambda a: a.fullname):
+            payload.append({
+                "fullname": account.fullname,
+                "name": account.name,
+                "type": account.type,
+                "placeholder": bool(account.placeholder),
+                "currency": account.commodity.mnemonic if account.commodity else None,
+                "guid": account.guid,
+            })
+        atomic_write_json(path, payload)
+        print(f"Exported {len(payload)} accounts to {path}")
 
     def read_csv(self) -> list[dict]:
         fmt, rows = read_bank_csv(self.csv_file, include_pending=self.include_pending)
@@ -109,6 +140,14 @@ class TransactionImporter:
             key=lambda account: account.fullname,
         )
         print(f"\nFound {len(all_accounts)} eligible statement-source accounts ({len(postable)} postable).")
+
+        # Fail fast instead of looping forever when nothing can be selected.
+        if not postable:
+            raise RuntimeError(
+                "No postable statement-source accounts found in the book. "
+                "Create or un-placeholder a bank/card account, or pass --source-account."
+            )
+
         for index, account in enumerate(postable, 1):
             currency = account.commodity.mnemonic if account.commodity else "?"
             print(f"  {index}. {account.fullname} [{account.type}] ({currency})")
@@ -193,40 +232,61 @@ class TransactionImporter:
         return commodity
 
     def _build_ledger_index(self) -> None:
+        if self.source_account is None:
+            return
+        source_guid = self.source_account.guid
         index = defaultdict(list)
+        pending_index = defaultdict(list)
         for txn in self.book.transactions:
             for split in txn.splits or []:
-                if split.account and split.account.guid == self.source_account.guid:
-                    index[(txn.post_date, round(float(split.value), 2))].append(txn)
+                if split.account and split.account.guid == source_guid:
+                    value = round(float(split.value), 2)
+                    index[(txn.post_date, value)].append(txn)
+                    pending_index[value].append(txn)
         self._existing_ledger_index = index
+        self._pending_ledger_index = pending_index
         print(f"Indexed {sum(len(v) for v in index.values())} source-account ledger entries")
 
-    def _exact_ledger_duplicate(self, tx: dict):
+    def _exact_ledger_duplicate(self, tx: dict) -> Optional[DuplicateMatch]:
         if not self._existing_ledger_index:
             return None
         key = (parse_tx_date(tx["date"]).date(), round(float(tx["amount"]), 2))
         candidates = self._existing_ledger_index.get(key, [])
         if not candidates:
             return None
-        return max(
-            candidates,
-            key=lambda item: difflib.SequenceMatcher(
-                None,
-                normalize_payee(tx["payee"]),
-                normalize_payee(item.description or ""),
-            ).ratio(),
-        )
+        payee_norm = normalize_payee(tx["payee"])
+        best = None
+        best_score = 0.0
+        for item in candidates:
+            score = difflib.SequenceMatcher(
+                None, payee_norm, normalize_payee(item.description or "")
+            ).ratio()
+            if score > best_score:
+                best = item
+                best_score = score
+        if best is None or best_score < EXACT_DUPLICATE_MIN_SIMILARITY:
+            return None
+        return DuplicateMatch(txn=best, similarity=best_score)
 
-    def _pending_ledger_duplicate(self, tx: dict):
+    def _pending_ledger_duplicate(self, tx: dict) -> Optional[DuplicateMatch]:
         if not tx.get("is_pending"):
+            return None
+        if self.source_account is None:
             return None
         pending_date = parse_tx_date(tx["date"]).date()
         amount = round(float(tx["amount"]), 2)
         payee = normalize_payee(tx["payee"])
+
+        # Use the amount index when available (O(1) lookup), otherwise fall
+        # back to a full scan.
+        if self._pending_ledger_index is not None:
+            candidates = self._pending_ledger_index.get(amount, [])
+        else:
+            candidates = self.book.transactions
+
         best = None
         best_score = 0.0
-
-        for txn in self.book.transactions:
+        for txn in candidates:
             if not txn.post_date:
                 continue
             if abs((txn.post_date - pending_date).days) > self.pending_duplicate_window_days:
@@ -250,9 +310,9 @@ class TransactionImporter:
                 best = txn
                 best_score = score
 
-        if best is None or best_score < 0.55:
+        if best is None or best_score < PENDING_DUPLICATE_MIN_SIMILARITY:
             return None
-        return best, best_score
+        return DuplicateMatch(txn=best, similarity=best_score)
 
     def _mark_skipped(self, tx: dict, reason: str) -> None:
         self.imported_tx[tx["import_hash"]] = {
@@ -271,7 +331,7 @@ class TransactionImporter:
         result = self._pending_ledger_duplicate(tx)
         if result is None:
             return False
-        txn, similarity = result
+        txn, similarity = result.txn, result.similarity
         print("\n  POSSIBLE PENDING-TO-COMPLETED DUPLICATE")
         print(f"    Pending CSV row: {tx['date']} | {tx['payee']} | {tx['amount']:.2f} {tx['currency']}")
         print(f"    Existing ledger: {txn.post_date} | {txn.description!r} | same source amount")
@@ -320,7 +380,7 @@ class TransactionImporter:
             if self.check_ledger:
                 duplicate = self._exact_ledger_duplicate(tx)
                 if duplicate is not None:
-                    print(f"  POSSIBLE DUPLICATE: {duplicate.post_date} | {duplicate.description!r}")
+                    print(f"  POSSIBLE DUPLICATE: {duplicate.txn.post_date} | {duplicate.txn.description!r}")
                     if self.dry_run:
                         continue
                     answer = input("  Is this the same transaction? [Y]es (skip) / n (import anyway): ").strip().lower()
@@ -334,6 +394,10 @@ class TransactionImporter:
                 if destination and self.matcher._acct_currency_matches(destination, tx["currency"]):
                     print(f"  MAPPED: {destination.fullname}")
                     if self.dry_run or self.auto_accept:
+                        if not self.dry_run:
+                            # auto_accept performs a real import, so track usage
+                            # just like the interactive accept path does.
+                            self.payee_mapper.update_last_used(tx["payee"])
                         self._prepare_tx(destination, tx)
                         continue
                     answer = input("  Use mapping? [Y]/n/edit: ").strip().lower()
@@ -509,7 +573,19 @@ class TransactionImporter:
             return
 
         self._create_database_backup()
+        skipped = 0
         for info in self.tx_to_create:
+            # Defensive currency check: never post a transaction whose
+            # destination account is in a different commodity.
+            if not self.matcher._acct_currency_matches(info["dest_account"], info["commodity"].mnemonic):
+                print(
+                    f"  WARNING: skipping {info['payee']!r}: destination "
+                    f"{info['dest_account'].fullname} currency does not match "
+                    f"{info['commodity'].mnemonic}"
+                )
+                skipped += 1
+                continue
+
             post_date = parse_tx_date(info["date"])
             amount = info["amount"]
             transaction = piecash.Transaction(
@@ -544,4 +620,5 @@ class TransactionImporter:
 
         self.book.save()
         self._save_imported()
-        print(f"Saved {len(self.tx_to_create)} transactions")
+        saved = len(self.tx_to_create) - skipped
+        print(f"Saved {saved} transactions" + (f" ({skipped} skipped)" if skipped else ""))

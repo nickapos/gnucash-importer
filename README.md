@@ -201,6 +201,29 @@ python ./income_expense_report.py \
 
 See the report generator’s `--help` output for currency conversion, detail, CSV, and plot options.
 
+## Testing
+
+The suite is split by interpreter because only the project virtualenv has `piecash` installed:
+
+```bash
+# Full suite (requires piecash — run inside the venv):
+.venv/bin/python -m pytest tests/ -q
+
+# piecash-free modules only (system python; importer/validator tests auto-skip):
+python3 -m pytest tests/ -q
+```
+
+| Test file | Covers |
+|---|---|
+| `tests/test_bank_formats.py` | CSV detection, row mappers, amount parsing |
+| `tests/test_account_matching.py` | Account cache, currency filtering, suggestions |
+| `tests/test_mappings.py` | Payee mappings, history analysis |
+| `tests/test_utils.py` | Date parsing, tokenization, normalization |
+| `tests/test_importer.py` | `TransactionImporter`: hashing, duplicate detection, backups, account creation, `execute_import` |
+| `tests/test_validate_import.py` | CSV row loading, import-history loading, validation/`--fix` reporting |
+
+`tests/test_importer.py` and `tests/test_validate_import.py` import `piecash` and are skipped automatically under the system `python3`.
+
 ## Locks
 
 The importer closes GnuCash in a `finally` block. If an earlier crash leaves a stale SQLite lock, close GnuCash and all import processes, then run:
@@ -210,3 +233,34 @@ python clear_gnclock.py portfolio-sqlite.gnucash
 ```
 
 Only clear a lock when no process genuinely has the book open.
+
+---
+
+## Review Changes Log (2025-01-09)
+
+**validate_import.py** — Fixed broken `gnucash_importer` import; now uses `bank_formats`, `config`, `utils`.
+
+**importer.py** — Improved `_load_imported()` exception handling (no longer silent); added `0.8` payee-similarity threshold to `_exact_ledger_duplicate()`.
+
+**account_matching.py** — Fixed variable shadowing in `find_matching_accounts()` return; improved `suggest_category()` word-boundary matching.
+
+**bank_formats.py** — Fixed potential `None` memo from `map_revolut()`.
+
+**utils.py** — Added `%z` timezone-aware date format to `parse_tx_date()`.
+
+**mappings.py** — Added `datetime.now()` fallback to `analyze()` sort to prevent `None` comparison crash.
+
+**income_expense_report.py** — Fixed CSV `Decimal` formatting (`str()` -> `f"{:.2f}"`); added empty-date guard to `transaction_date()`.
+
+All changes applied during this session; files syntax-checked and verified.
+
+
+## Review Changes Log (2026-09-20)
+
+**tests/test_importer.py** — New piecash-backed suite covering `TransactionImporter` hashing, state-file handling, book open/close, commodity lookup, ledger indexing, exact/pending duplicate detection, pending-decision paths, source-account resolution, account-path creation, `execute_import`, and backup/prune behavior. All piecash ORM calls are mocked; no real GnuCash book is touched.
+
+**tests/test_validate_import.py** — New piecash-backed suite covering CSV row loading with importer-compatible hashes, pending-row filtering, `load_imported()` resilience, and end-to-end `main()` reporting/`--fix` runs against a mocked book.
+
+**README.md** — Documented the two-interpreter test workflow (`python3` skips the piecash modules; `.venv/bin/python` runs the full suite).
+
+Both new test modules import `piecash` and are skipped automatically under the system python. Full suite (venv): 162 passed. System python: 100 passed, 2 skipped.

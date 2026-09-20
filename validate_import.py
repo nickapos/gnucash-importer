@@ -22,54 +22,38 @@ Usage:
 import argparse
 import json
 import os
-import sys
-import hashlib
-import csv as csv_module
 
 import piecash
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from gnucash_importer import (
-    BankFormatMapper,
-    DUPLICATE_CHECK_FILE,
-    parse_tx_date,
-)
-
-
-def _tx_hash(tx: dict) -> str:
-    d = f"{tx['date']}|{tx['payee']}|{tx['amount']:.2f}"
-    return hashlib.md5(d.encode("utf-8")).hexdigest()
+from bank_formats import read_bank_csv
+from config import DUPLICATE_CHECK_FILE
+from utils import compute_tx_hash, parse_tx_date
 
 
 def read_csv_rows(csv_file: str, skip_pending: bool = True):
-    mapper = BankFormatMapper()
-    fmt = mapper.detect_format(csv_file)
+    """Read CSV rows using the SAME parser as the importer.
+
+    Sharing ``read_bank_csv`` guarantees every supported format (revolut,
+    bof_scot, credit_card, alpha_gr, generic) is handled identically and the
+    import hashes always match.
+    """
+    fmt, rows = read_bank_csv(csv_file, include_pending=not skip_pending)
     print(f"Detected bank format: {fmt}")
-    rows = []
-    with open(csv_file, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv_module.DictReader(f)
-        for i, row in enumerate(reader, 1):
-            if not any(str(v).strip() for v in row.values()):
-                continue
-            if fmt == "revolut":
-                m = mapper.map_revolut(row)
-            elif fmt == "bof_scot":
-                m = mapper.map_bof_scot(row)
-            else:
-                m = mapper.map_generic(row)
-            if skip_pending and str(m.get("state", "")).upper() == "PENDING":
-                continue
-            m["row_number"] = i
-            m["import_hash"] = _tx_hash(m)
-            rows.append(m)
+    for row in rows:
+        row["import_hash"] = compute_tx_hash(row)
     return rows
 
 
 def load_imported() -> dict:
-    if os.path.exists(DUPLICATE_CHECK_FILE):
+    if not os.path.exists(DUPLICATE_CHECK_FILE):
+        return {}
+    try:
         with open(DUPLICATE_CHECK_FILE, "r") as f:
             return json.load(f)
-    return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"Warning: could not read {DUPLICATE_CHECK_FILE}: {exc}")
+        print("  Starting with empty import history.")
+        return {}
 
 
 def main():
@@ -92,17 +76,18 @@ def main():
     rows = read_csv_rows(args.csv_file, skip_pending=not args.include_pending)
     print(f"Read {len(rows)} CSV rows\n")
 
-    book = piecash.open_book(
-        os.path.abspath(args.gnucash_file), readonly=not args.fix, open_if_lock=True
-    )
-
-    checked = 0
-    skipped_count = 0
-    legacy_count = 0
-    mismatches = []
-    not_found = []
-
+    book = None
     try:
+        book = piecash.open_book(
+            os.path.abspath(args.gnucash_file), readonly=not args.fix, open_if_lock=True
+        )
+
+        checked = 0
+        skipped_count = 0
+        legacy_count = 0
+        mismatches = []
+        not_found = []
+
         for row in rows:
             record = imported.get(row["import_hash"])
             if not record:
@@ -161,9 +146,9 @@ def main():
             print(f"\nSaved {len(mismatches)} correction(s) to {args.gnucash_file}")
         elif mismatches:
             print("\nRun again with --fix to correct these dates.")
-
     finally:
-        book.close()
+        if book is not None:
+            book.close()
 
 
 if __name__ == "__main__":
