@@ -116,7 +116,13 @@ def input_with_completion(prompt: str, completer: AccountPathCompleter) -> str:
         old_delims = readline.get_completer_delims()
         readline.set_completer(completer.complete)
         readline.set_completer_delims("")
-        readline.parse_and_bind("tab: complete")
+        # macOS ships Python against libedit, which ignores the GNU readline
+        # binding name "tab: complete" (TAB then inserts a literal tab and
+        # completion never fires). Use libedit's native rl_complete binding.
+        if getattr(readline, "__doc__", "") and "libedit" in readline.__doc__.lower():
+            readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            readline.parse_and_bind("tab: complete")
         try:
             return input(prompt)
         finally:
