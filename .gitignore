@@ -3,3 +3,10 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+.continue/
+.imported_transactions.json
+.payee_account_mappings.json
+.transaction_history_analysis.json
+accounts.json
+backups/
+portfolio-sqlite.gnucash
